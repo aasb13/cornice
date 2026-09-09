@@ -1,0 +1,21 @@
+[package]
+name = "rustbar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+calloop = "0.14.4"
+calloop-wayland-source = "0.4.1"
+clap = { version = "4.6.6", features = ["derive"] }
+env_logger = "0.11.11"
+log = "0.4.33"
+rusttype = "0.9.3"
+tokio = { version = "1", features = ["full"] }
+system-tray = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
+chrono = "0.4"
+hyprland = "0.4.0-beta.3"
+smithay-client-toolkit = "0.20.0"
+wayland-client = "0.31.15"
+wayland-protocols = "0.32"

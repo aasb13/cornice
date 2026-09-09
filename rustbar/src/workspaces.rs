@@ -1,0 +1,196 @@
+use hyprland::data::{Workspace, Workspaces};
+use hyprland::shared::{HyprData, HyprDataActive, HyprDataVec};
+use rusttype::{Font, Scale, point};
+
+use crate::theme::{draw_bordered_box, fill_rect, ACCENT, BG, INACTIVE};
+
+const NUM_SLOTS: i32 = 10;
+/// Button width — waybar `#workspaces button { min-width: 22px }`.
+const BOX_WIDTH: u32 = 22;
+/// 1px accent border around the workspaces container
+/// (waybar `#workspaces { border: 1px solid accent }`).
+const BORDER: u32 = 1;
+
+pub struct WorkspaceList {
+    font: Option<Font<'static>>,
+    /// (workspace id, x_start, x_end) for the boxes drawn in the last render —
+    /// used for hit-testing pointer clicks/hover.
+    layout: Vec<(i32, u32, u32)>,
+    /// Currently hovered slot (1..=NUM_SLOTS), for the `:hover` text color.
+    hovered: Option<i32>,
+}
+
+impl WorkspaceList {
+    pub fn new() -> Self {
+        Self { font: None, layout: Vec::new(), hovered: None }
+    }
+
+    pub fn init(&mut self) {
+        let paths = [
+            "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "/usr/share/fonts/TTF/TerminusTTF.ttf",
+        ];
+        for path in &paths {
+            if let Ok(data) = std::fs::read(path) {
+                if let Some(font) = Font::try_from_vec(data) {
+                    self.font = Some(font);
+                    return;
+                }
+            }
+        }
+        log::error!("no font found for workspaces");
+    }
+
+    /// Total pixel width this module occupies on the left of the bar.
+    pub fn width(&self) -> u32 {
+        2 * BORDER + NUM_SLOTS as u32 * BOX_WIDTH
+    }
+
+    pub fn render(&mut self, canvas: &mut [u8], x_offset: u32, height: u32, stride: u32) {
+        self.layout.clear();
+        let font = match &self.font {
+            Some(f) => f,
+            None => return,
+        };
+
+        let active_id = Workspace::get_active().map(|w| w.id).unwrap_or(-1);
+        let existing: Vec<i32> = Workspaces::get()
+            .map(|ws| ws.to_vec().iter().map(|w| w.id).collect())
+            .unwrap_or_default();
+
+        // ── Container: opaque black background with a 1px accent border ──
+        //    (waybar `#workspaces { background:#000; border:1px solid accent }`).
+        let container_w = 2 * BORDER + NUM_SLOTS as u32 * BOX_WIDTH;
+        draw_bordered_box(canvas, stride, x_offset, 0, container_w, height, BG, ACCENT);
+
+        let bar_width = stride / 4;
+        let scale = Scale::uniform(height as f32 * 0.5);
+        let v_metrics = font.v_metrics(scale);
+        let glyph_height = v_metrics.ascent - v_metrics.descent;
+
+        for slot in 1..=NUM_SLOTS {
+            // Button rect sits inside the 1px border, offset by the side margin.
+            let bx = x_offset + BORDER + (slot - 1) as u32 * BOX_WIDTH;
+            let by = BORDER;
+            let bw = BOX_WIDTH;
+            let bh = height.saturating_sub(2 * BORDER);
+            self.layout.push((slot, bx, bx + bw));
+
+            let is_active = slot == active_id;
+
+            // active → accent background (waybar `.active { background: accent }`)
+            if is_active {
+                fill_rect(canvas, stride, bx, by, bw, bh, ACCENT, 255);
+            }
+
+            // Text color, matching waybar's button/empty/active/hover rules:
+            //   active            → black (on accent bg)
+            //   exists, not active → accent
+            //   empty + hover      → accent (`:hover { color: accent }`)
+            //   empty              → #222222 (`.empty { color: #222 }`)
+            let (r, g, b) = if is_active {
+                (0, 0, 0)
+            } else if existing.contains(&slot) || self.hovered == Some(slot) {
+                ACCENT
+            } else {
+                INACTIVE
+            };
+
+            let text = slot.to_string();
+            let total_width: f32 = text
+                .chars()
+                .map(|c| font.glyph(c).scaled(scale).h_metrics().advance_width)
+                .sum();
+            let x = bx as f32 + (bw as f32 - total_width) / 2.0;
+            let y = by as f32 + (bh as f32 - glyph_height) / 2.0 + v_metrics.ascent;
+            let mut pen = point(x, y);
+
+            for c in text.chars() {
+                let glyph = font.glyph(c);
+                let scaled_glyph = glyph.scaled(scale);
+                let advance_width = scaled_glyph.h_metrics().advance_width;
+                let positioned_glyph = scaled_glyph.positioned(pen);
+
+                if let Some(bb) = positioned_glyph.pixel_bounding_box() {
+                    positioned_glyph.draw(|x_rel, y_rel, v| {
+                        let xi = bb.min.x + x_rel as i32;
+                        let yi = bb.min.y + y_rel as i32;
+                        if xi >= 0 && yi >= 0 && (xi as u32) < bar_width && (yi as u32) < height {
+                            let off = yi as usize * stride as usize + xi as usize * 4;
+                            if off + 3 < canvas.len() {
+                                // gamma-correct coverage, then premultiplied
+                                // src-over so text composites correctly over
+                                // either the black container bg or the accent
+                                // active-button fill.
+                                let gv = v.powf(1.0 / 2.2);
+                                let src = [b as f32, g as f32, r as f32]; // b, g, r
+                                for c in 0..3 {
+                                    let s = src[c] * gv;
+                                    let d = canvas[off + c] as f32;
+                                    canvas[off + c] = (s + d * (1.0 - gv)).min(255.0) as u8;
+                                }
+                                let da = canvas[off + 3] as f32;
+                                canvas[off + 3] = (255.0 * gv + da * (1.0 - gv)).min(255.0) as u8;
+                            }
+                        }
+                    });
+                }
+                pen.x += advance_width;
+            }
+        }
+    }
+
+    /// Which workspace slot (if any) the given bar-local x coordinate falls
+    /// inside. Used both for cursor-icon feedback and click dispatch.
+    pub fn hit_test(&self, x: f64) -> Option<i32> {
+        let x = x as u32;
+        self.layout
+            .iter()
+            .find(|(_, start, end)| x >= *start && x < *end)
+            .map(|(id, _, _)| *id)
+    }
+
+    /// Update the hovered slot from a pointer x coordinate. Returns whether
+    /// the hover state changed so the caller redraws only when needed.
+    pub fn update_hover(&mut self, x: f64) -> bool {
+        let new = self.hit_test(x);
+        let changed = new != self.hovered;
+        self.hovered = new;
+        changed
+    }
+
+    /// Clear the hovered slot (pointer left the bar). Returns whether the
+    /// hover state changed.
+    pub fn clear_hover(&mut self) -> bool {
+        let changed = self.hovered.is_some();
+        self.hovered = None;
+        changed
+    }
+
+    /// Ask Hyprland to switch to the given workspace via `hyprctl` directly
+    /// rather than hyprland-rs's own socket dispatch — hyprland-rs still
+    /// sends the pre-Lua-config dispatch string format, which current
+    /// Hyprland's Lua-wrapped command parser rejects. `hyprctl` is kept in
+    /// lockstep with Hyprland itself, so it's the more reliable path for
+    /// dispatch specifically (reads/`Workspace::get_active`/etc via the
+    /// crate are unaffected and still fine).
+    pub fn switch_to(&self, id: i32) {
+        let expr = format!("hl.dsp.focus({{ workspace = \"{id}\" }})");
+        let result = std::process::Command::new("hyprctl")
+            .args(["dispatch", &expr])
+            .output();
+        match result {
+            Ok(out) if !out.status.success() => {
+                log::error!(
+                    "hyprctl dispatch failed (status {:?}): stdout={:?} stderr={:?}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Err(err) => log::error!("failed to run hyprctl: {err}"),
+            _ => {}
+        }
+    }
+}

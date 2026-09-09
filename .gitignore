@@ -1,0 +1,104 @@
+# =============================================================================
+# .gitignore — rustwall workspace (Rust Wayland compositor + status bar)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Rust / Cargo
+# ---------------------------------------------------------------------------
+# Cargo build artifacts. The workspace shares a single root `target/`; the
+# per-crate entries are kept as a safety net for standalone/non-workspace builds.
+/target
+/rustwall/target
+/rustbar/target
+
+# Backup files produced by rustfmt / rustc.
+**/*.rs.bk
+
+# NOTE: Cargo.lock is intentionally COMMITTED here because this project ships
+# binary executables (rustwall, rustbar). Do NOT ignore it. (Only libraries
+# typically omit Cargo.lock from version control.)
+
+# ---------------------------------------------------------------------------
+# Profiling, coverage & benchmark output
+# ---------------------------------------------------------------------------
+# LLVM / GCC coverage and profiling artifacts.
+*.profraw
+*.profdata
+*.gcno
+*.gcda
+*.gcov
+
+# cargo-tarpaulin / cargo-llvm-cov reports.
+/tarpaulin-report.html
+/cobertura.xml
+/lcov.info
+/coverage/
+
+# perf(1) data and core dumps from crashed runs.
+perf.data
+perf.data.*
+core
+core.*
+
+# ---------------------------------------------------------------------------
+# Logs & runtime output
+# ---------------------------------------------------------------------------
+*.log
+*.log.*
+
+# ---------------------------------------------------------------------------
+# Environment files & local secrets
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Editor / IDE
+# ---------------------------------------------------------------------------
+# IntelliJ / RustRover / CLion
+.idea/
+*.iml
+
+# VS Code (negate specific files below if you want to share editor config).
+.vscode/
+# !.vscode/settings.json
+# !.vscode/launch.json
+# !.vscode/tasks.json
+
+# JetBrains Fleet
+.fleet/
+
+# Zed
+.zed/
+
+# ---------------------------------------------------------------------------
+# AI assistant local config
+# ---------------------------------------------------------------------------
+# Claude Code per-user settings; shared .claude/ config (settings.json,
+# commands/, agents/) remains committable.
+.claude/settings.local.json
+
+# ---------------------------------------------------------------------------
+# Operating-system cruft
+# ---------------------------------------------------------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux / generic
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
