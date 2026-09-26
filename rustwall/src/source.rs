@@ -47,11 +47,6 @@ pub trait FrameSource {
         None
     }
 
-    /// TEMP INSTRUMENTATION: implementation-defined probe, returns 0 by default.
-    fn dbg_atlas_len(&self) -> usize {
-        0
-    }
-
     /// Called when the machine's power state changes, so an animated source
     /// can spend less effort: `on_battery` is true only while a battery
     /// exists *and* is discharging (a desktop never gets this, and a plugged

@@ -14,22 +14,34 @@
 //!     it only reports power saving while it is genuinely running on the
 //!     battery.
 //!
-//! Reading sysfs is cheap but not free, so [`PowerMonitor`] throttles it:
-//! [`PowerMonitor::poll`] only touches the filesystem at most once per
-//! interval, and answers from the cached value in between.
+//! Reading sysfs is *not* reliably fast: on a laptop the power-supply
+//! attributes are served by ACPI, and a read can occasionally block for tens of
+//! milliseconds while the embedded controller is queried. Doing that on the
+//! event loop thread freezes the wallpaper for the duration, so the polling
+//! lives on its own thread and the event loop only ever reads an atomic.
+//!
+//! [`PowerMonitor::poll`] is therefore just a relaxed atomic load: it cannot
+//! block, no matter what the kernel is doing.
 
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// Where the kernel lists power supplies.
 const POWER_SUPPLY_DIR: &str = "/sys/class/power_supply";
 
-/// How often [`PowerMonitor::poll`] is allowed to touch the filesystem.
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// How often the background thread re-reads the power supplies. Unplugging is
+/// not something you notice within a second, and the slower we poll the less
+/// we lean on ACPI.
+const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Cached view of whether the machine is running on battery.
+/// Cached view of whether the machine is running on battery, refreshed by a
+/// background thread. Cheap to ask, safe to ask from the render loop.
 pub struct PowerMonitor {
-    on_battery: bool,
-    last_poll: Option<Instant>,
+    on_battery: Arc<AtomicBool>,
+    /// Kept only so the thread isn't detached from the struct; the process
+    /// exit ends it, and if it ever dies the cached value simply goes stale.
+    _poller: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Default for PowerMonitor {
@@ -39,28 +51,33 @@ impl Default for PowerMonitor {
 }
 
 impl PowerMonitor {
-    /// Create a monitor and take the first reading straight away, so callers
-    /// never act on a default `false` they haven't checked.
+    /// Start the poller and answer from its cache.
+    ///
+    /// The first reading is optimistic (`false` = on mains), so startup is
+    /// never delayed by a slow ACPI query; the thread corrects it within
+    /// milliseconds of spawning.
     pub fn new() -> Self {
-        let on_battery = on_battery_now();
+        let on_battery = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&on_battery);
+        let poller = std::thread::Builder::new()
+            .name("rustwall-power".to_string())
+            .spawn(move || {
+                loop {
+                    flag.store(on_battery_now(), Ordering::Relaxed);
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            })
+            .ok();
         Self {
             on_battery,
-            last_poll: Some(Instant::now()),
+            _poller: poller,
         }
     }
 
-    /// Re-read the state if the poll interval has elapsed, and return the
-    /// current answer. Cheap enough to call from the render timer: between
-    /// polls it just hands back the cached value.
+    /// The last known state. An atomic load: never touches the filesystem, so
+    /// it cannot stall the event loop no matter how slow ACPI is being.
     pub fn poll(&mut self) -> bool {
-        if self
-            .last_poll
-            .is_none_or(|t| t.elapsed() >= DEFAULT_POLL_INTERVAL)
-        {
-            self.on_battery = on_battery_now();
-            self.last_poll = Some(Instant::now());
-        }
-        self.on_battery
+        self.on_battery.load(Ordering::Relaxed)
     }
 }
 
@@ -172,18 +189,33 @@ mod tests {
     }
 
     #[test]
-    fn poll_agrees_with_a_direct_read() {
-        // Whatever this machine is, the monitor must answer something
-        // consistent with reading sysfs directly.
-        assert_eq!(PowerMonitor::new().poll(), on_battery_now());
+    fn monitor_converges_on_a_direct_read() {
+        // The poller starts optimistic, so give it a moment to publish its
+        // first real reading; then it must agree with reading sysfs directly.
+        let expected = on_battery_now();
+        let mut m = PowerMonitor::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while m.poll() != expected && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(m.poll(), expected);
     }
 
     #[test]
-    fn repeated_polls_are_stable() {
-        // Polling is throttled, so back-to-back polls can't disagree.
+    fn poll_is_an_atomic_load_and_never_blocks() {
+        // This is the whole point of the background thread: asking the
+        // monitor must not touch the filesystem, so it cannot inherit ACPI's
+        // tens-of-milliseconds stalls. A generous bound still catches a
+        // regression back to synchronous I/O.
         let mut m = PowerMonitor::new();
-        let first = m.poll();
-        assert_eq!(m.poll(), first);
-        assert_eq!(m.poll(), first);
+        let t = std::time::Instant::now();
+        for _ in 0..10_000 {
+            std::hint::black_box(m.poll());
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(50),
+            "10k polls took {:?} — poll() is doing I/O on the caller's thread",
+            t.elapsed()
+        );
     }
 }

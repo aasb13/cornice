@@ -1153,10 +1153,6 @@ impl FrameSource for RotatingTesseract {
         Some(Duration::from_micros(6000))
     }
 
-    fn dbg_atlas_len(&self) -> usize {
-        self.rain_atlas.values().map(|v| v.len()).sum()
-    }
-
     fn set_power_saving(&mut self, on_battery: bool) {
         self.power_saving = on_battery;
     }

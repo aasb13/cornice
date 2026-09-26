@@ -77,13 +77,6 @@ pub fn run(
         power: PowerMonitor::new(),
         power_save,
         on_battery: false,
-        dbg_last_tick: None,
-        dbg_frames: 0,
-        dbg_skips: 0,
-        dbg_target_ms: 6.0,
-        dbg_calls: 0,
-        dbg_gap_min: 1e9,
-        dbg_gap_max: 0.0,
     };
 
     // Two roundtrips, same as the original C main(): the first lets the
@@ -196,21 +189,10 @@ pub fn run(
             .map_err(|e| anyhow!("failed to insert render timer: {e}"))?;
     }
 
-    // A slow, separate timer for the battery check. It is deliberately not the
-    // render timer: that one can be 6ms, and re-reading sysfs 166 times a
-    // second to discover nothing has changed would be silly.
-    {
-        let qh_for_timer = qh.clone();
-        loop_handle
-            .insert_source(
-                Timer::from_duration(POWER_POLL_INTERVAL),
-                move |_deadline, _, app: &mut App| {
-                    app.check_power(&qh_for_timer);
-                    TimeoutAction::ToDuration(POWER_POLL_INTERVAL)
-                },
-            )
-            .map_err(|e| anyhow!("failed to insert power timer: {e}"))?;
-    }
+    // No separate timer for the battery: `PowerMonitor::poll` is now a single
+    // atomic load, so the render path can just check it as it goes. An earlier
+    // version polled sysfs from a timer on *this* thread and a slow ACPI read
+    // froze the wallpaper for 50-80ms every few seconds.
 
     loop {
         event_loop.dispatch(None, &mut app)?;
@@ -236,22 +218,13 @@ struct App {
     /// Set once, right after `init`, from `source.tick_interval()`, and then
     /// only used as the render timer's initial delay and fallback.
     interval: Option<std::time::Duration>,
-    /// Cached battery state, refreshed on a slow timer.
+    /// Battery state, refreshed by a background thread (see [`PowerMonitor`]).
     power: PowerMonitor,
     /// What to do while on battery, from the config.
     power_save: PowerSaveConfig,
     /// The state the source was last told about, so we only wake it on a
     /// change.
     on_battery: bool,
-    // TEMP INSTRUMENTATION
-    dbg_last_tick: Option<std::time::Instant>,
-    dbg_frames: u64,
-    dbg_skips: u32,
-    dbg_target_ms: f64,
-    dbg_calls: u64,
-    dbg_gap_min: f64,
-    dbg_gap_max: f64,
-
     /// The single SHM buffer we draw into, reused frame after frame. Replacing
     /// this (only on resize) drops the old one and lets the slot pool reclaim
     /// the memory. Keeping one buffer — instead of allocating a new one every
@@ -261,24 +234,12 @@ struct App {
     buf_h: u32,
 }
 
-/// How often the battery is re-read. Long enough to be invisible, short
-/// enough that plugging in restores full speed promptly.
-const POWER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
-
 impl App {
-    /// Re-read the battery and, if it changed, tell the source. Unplugging
-    /// costs a throttled wallpaper; plugging back in must always restore full
-    /// speed, so this runs on a timer for the life of the process.
-    /// TEMP INSTRUMENTATION: how big has the lazy glyph atlas grown?
-    fn dbg_probe_atlases(&self) -> usize {
-        let probe = self.source.dbg_atlas_len();
-        probe
-    }
-
-    fn check_power(&mut self, _qh: &QueueHandle<Self>) {
-        let __p0 = std::time::Instant::now();
+    /// Notice a change of power source and tell the source about it.
+    /// Unplugging costs a throttled wallpaper; plugging back in must always
+    /// restore full speed. Called once per frame, and it costs one atomic load.
+    fn check_power(&mut self) {
         let on_battery = self.power_save.enabled && self.power.poll();
-        eprintln!("DBGPOWER took={:.3}ms on_battery={on_battery}", __p0.elapsed().as_secs_f64() * 1000.0);
         if on_battery == self.on_battery {
             return;
         }
@@ -295,27 +256,9 @@ impl App {
     }
 
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
-        // TEMP INSTRUMENTATION
-        let __t0 = std::time::Instant::now();
-        let __tick = self.dbg_last_tick.replace(__t0);
-        let __gap = __tick.map(|p| __t0.duration_since(p).as_secs_f64() * 1000.0).unwrap_or(0.0);
-        self.dbg_calls += 1;
-        if self.dbg_calls % 200 == 0 {
-            eprintln!(
-                "DBG2 calls={} commits={} last200gaps[min={:.2} max={:.2}] skips={} atlas={}",
-                self.dbg_calls,
-                self.dbg_frames,
-                self.dbg_gap_min,
-                self.dbg_gap_max,
-                self.dbg_skips,
-                self.dbg_probe_atlases(),
-            );
-            self.dbg_gap_min = 1e9;
-            self.dbg_gap_max = 0.0;
-        } else {
-            self.dbg_gap_min = self.dbg_gap_min.min(__gap);
-            self.dbg_gap_max = self.dbg_gap_max.max(__gap);
-        }
+        // Cheap enough to do every frame (one atomic load), and it means a
+        // battery change takes effect as soon as the background thread sees it.
+        self.check_power();
         let layer = match &self.layer {
             Some(l) => l,
             None => return,
@@ -362,7 +305,6 @@ impl App {
             match pool.canvas(buffer) {
                 Some(c) => c,
                 None => {
-                    self.dbg_skips += 1; // TEMP
                     return; // compositor still showing the previous frame
                 }
             }
@@ -381,19 +323,6 @@ impl App {
             return;
         }
         layer.commit();
-
-        // TEMP INSTRUMENTATION: one line per drawn frame.
-        self.dbg_frames += 1;
-        if let Some(prev) = __tick {
-            let gap = __t0.duration_since(prev).as_secs_f64() * 1000.0;
-            let work = __t0.elapsed().as_secs_f64() * 1000.0;
-            if gap > self.dbg_target_ms * 1.35 || work > self.dbg_target_ms {
-                eprintln!(
-                    "DBGAP gap={gap:.2}ms work={work:.2}ms target={:.2}ms",
-                    self.dbg_target_ms
-                );
-            }
-        }
     }
 }
 
@@ -471,9 +400,6 @@ impl LayerShellHandler for App {
                 log::info!("running on battery: starting throttled");
             }
             self.interval = self.source.tick_interval();
-            if let Some(i) = self.interval {
-                self.dbg_target_ms = i.as_secs_f64() * 1000.0;
-            }
             self.draw(qh);
         }
     }
