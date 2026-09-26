@@ -20,9 +20,14 @@ use smithay_client_toolkit::{
     registry_handlers,
     shell::{
         WaylandSurface,
-        wlr_layer::{Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
+        wlr_layer::{
+            Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
+        },
     },
-    shm::{Shm, ShmHandler, slot::{Buffer, SlotPool}},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
 use wayland_client::{
     Connection, QueueHandle,
@@ -30,22 +35,28 @@ use wayland_client::{
     protocol::{wl_output, wl_shm, wl_surface},
 };
 
+use crate::config::PowerSaveConfig;
+use crate::power::PowerMonitor;
 use crate::source::FrameSource;
 
 /// Claim `monitor` (or, if `None`, the last output the compositor reports —
 /// matching the original vecpaper's fallback behavior) and start rendering
 /// `source` into a `wlr-layer-shell` background surface on it. Blocks
 /// forever (or until the layer surface is closed by the compositor).
-pub fn run(monitor: Option<String>, source: Box<dyn FrameSource>) -> Result<()> {
+pub fn run(
+    monitor: Option<String>,
+    source: Box<dyn FrameSource>,
+    power_save: PowerSaveConfig,
+) -> Result<()> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
-    let (globals, mut event_queue) = registry_queue_init::<App>(&conn)
-        .context("failed to enumerate Wayland globals")?;
+    let (globals, mut event_queue) =
+        registry_queue_init::<App>(&conn).context("failed to enumerate Wayland globals")?;
     let qh = event_queue.handle();
 
     let compositor_state =
         CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
-    let layer_shell =
-        LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available (unsupported compositor?)")?;
+    let layer_shell = LayerShell::bind(&globals, &qh)
+        .context("wlr-layer-shell not available (unsupported compositor?)")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
 
     let mut app = App {
@@ -63,14 +74,28 @@ pub fn run(monitor: Option<String>, source: Box<dyn FrameSource>) -> Result<()> 
         buffer: None,
         buf_w: 0,
         buf_h: 0,
+        power: PowerMonitor::new(),
+        power_save,
+        on_battery: false,
+        dbg_last_tick: None,
+        dbg_frames: 0,
+        dbg_skips: 0,
+        dbg_target_ms: 6.0,
+        dbg_calls: 0,
+        dbg_gap_min: 1e9,
+        dbg_gap_max: 0.0,
     };
 
     // Two roundtrips, same as the original C main(): the first lets the
     // registry globals arrive, the second lets each wl_output's
     // geometry/mode/name/description/done events arrive so we actually know
     // what monitors exist before picking one.
-    event_queue.roundtrip(&mut app).context("initial roundtrip failed")?;
-    event_queue.roundtrip(&mut app).context("output info roundtrip failed")?;
+    event_queue
+        .roundtrip(&mut app)
+        .context("initial roundtrip failed")?;
+    event_queue
+        .roundtrip(&mut app)
+        .context("output info roundtrip failed")?;
 
     let outputs: Vec<_> = app.output_state.outputs().collect();
     if outputs.is_empty() {
@@ -105,10 +130,7 @@ pub fn run(monitor: Option<String>, source: Box<dyn FrameSource>) -> Result<()> 
         .find(|m| m.current)
         .map(|m| (m.dimensions.0 as u32, m.dimensions.1 as u32))
         .ok_or_else(|| anyhow!("chosen monitor reported no current mode"))?;
-    debug!(
-        "targeting output {:?} ({}x{})",
-        info.name, width, height
-    );
+    debug!("targeting output {:?} ({}x{})", info.name, width, height);
 
     let surface = compositor_state.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(
@@ -123,7 +145,9 @@ pub fn run(monitor: Option<String>, source: Box<dyn FrameSource>) -> Result<()> 
     layer.set_size(width, height);
     // Passthrough: the wallpaper should never intercept clicks.
     let empty_region = Region::new(&compositor_state).context("failed to create input region")?;
-    layer.wl_surface().set_input_region(Some(empty_region.wl_region()));
+    layer
+        .wl_surface()
+        .set_input_region(Some(empty_region.wl_region()));
     drop(empty_region);
     // Initial commit with no buffer attached: this is required before the
     // compositor will send us a configure event. See WaylandSurface::commit.
@@ -137,7 +161,8 @@ pub fn run(monitor: Option<String>, source: Box<dyn FrameSource>) -> Result<()> 
     app.height = height;
     app.layer = Some(layer);
 
-    let mut event_loop: EventLoop<App> = EventLoop::try_new().context("failed to create event loop")?;
+    let mut event_loop: EventLoop<App> =
+        EventLoop::try_new().context("failed to create event loop")?;
     let loop_handle = event_loop.handle();
 
     // Wait for the first configure event (which triggers the first draw and,
@@ -157,11 +182,34 @@ pub fn run(monitor: Option<String>, source: Box<dyn FrameSource>) -> Result<()> 
     if let Some(interval) = app.interval {
         let qh_for_timer = qh.clone();
         loop_handle
-            .insert_source(Timer::from_duration(interval), move |_deadline, _, app: &mut App| {
-                app.draw(&qh_for_timer);
-                TimeoutAction::ToDuration(interval)
-            })
+            .insert_source(
+                Timer::from_duration(interval),
+                move |_deadline, _, app: &mut App| {
+                    app.draw(&qh_for_timer);
+                    // Re-read the interval every tick rather than capturing it, so
+                    // a source that changes its mind (frame-rate cap following the
+                    // power state, say) is honoured from the very next frame.
+                    let next = app.source.tick_interval().unwrap_or(interval);
+                    TimeoutAction::ToDuration(next)
+                },
+            )
             .map_err(|e| anyhow!("failed to insert render timer: {e}"))?;
+    }
+
+    // A slow, separate timer for the battery check. It is deliberately not the
+    // render timer: that one can be 6ms, and re-reading sysfs 166 times a
+    // second to discover nothing has changed would be silly.
+    {
+        let qh_for_timer = qh.clone();
+        loop_handle
+            .insert_source(
+                Timer::from_duration(POWER_POLL_INTERVAL),
+                move |_deadline, _, app: &mut App| {
+                    app.check_power(&qh_for_timer);
+                    TimeoutAction::ToDuration(POWER_POLL_INTERVAL)
+                },
+            )
+            .map_err(|e| anyhow!("failed to insert power timer: {e}"))?;
     }
 
     loop {
@@ -185,8 +233,25 @@ struct App {
     configured: bool,
     exit: bool,
     source: Box<dyn FrameSource>,
-    /// Set once, right after `init`, from `source.tick_interval()`.
+    /// Set once, right after `init`, from `source.tick_interval()`, and then
+    /// only used as the render timer's initial delay and fallback.
     interval: Option<std::time::Duration>,
+    /// Cached battery state, refreshed on a slow timer.
+    power: PowerMonitor,
+    /// What to do while on battery, from the config.
+    power_save: PowerSaveConfig,
+    /// The state the source was last told about, so we only wake it on a
+    /// change.
+    on_battery: bool,
+    // TEMP INSTRUMENTATION
+    dbg_last_tick: Option<std::time::Instant>,
+    dbg_frames: u64,
+    dbg_skips: u32,
+    dbg_target_ms: f64,
+    dbg_calls: u64,
+    dbg_gap_min: f64,
+    dbg_gap_max: f64,
+
     /// The single SHM buffer we draw into, reused frame after frame. Replacing
     /// this (only on resize) drops the old one and lets the slot pool reclaim
     /// the memory. Keeping one buffer — instead of allocating a new one every
@@ -196,8 +261,61 @@ struct App {
     buf_h: u32,
 }
 
+/// How often the battery is re-read. Long enough to be invisible, short
+/// enough that plugging in restores full speed promptly.
+const POWER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl App {
+    /// Re-read the battery and, if it changed, tell the source. Unplugging
+    /// costs a throttled wallpaper; plugging back in must always restore full
+    /// speed, so this runs on a timer for the life of the process.
+    /// TEMP INSTRUMENTATION: how big has the lazy glyph atlas grown?
+    fn dbg_probe_atlases(&self) -> usize {
+        let probe = self.source.dbg_atlas_len();
+        probe
+    }
+
+    fn check_power(&mut self, _qh: &QueueHandle<Self>) {
+        let __p0 = std::time::Instant::now();
+        let on_battery = self.power_save.enabled && self.power.poll();
+        eprintln!("DBGPOWER took={:.3}ms on_battery={on_battery}", __p0.elapsed().as_secs_f64() * 1000.0);
+        if on_battery == self.on_battery {
+            return;
+        }
+        self.on_battery = on_battery;
+        log::info!(
+            "power source changed: {}",
+            if on_battery {
+                "on battery, throttling"
+            } else {
+                "on mains, full speed"
+            }
+        );
+        self.source.set_power_saving(on_battery);
+    }
+
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
+        // TEMP INSTRUMENTATION
+        let __t0 = std::time::Instant::now();
+        let __tick = self.dbg_last_tick.replace(__t0);
+        let __gap = __tick.map(|p| __t0.duration_since(p).as_secs_f64() * 1000.0).unwrap_or(0.0);
+        self.dbg_calls += 1;
+        if self.dbg_calls % 200 == 0 {
+            eprintln!(
+                "DBG2 calls={} commits={} last200gaps[min={:.2} max={:.2}] skips={} atlas={}",
+                self.dbg_calls,
+                self.dbg_frames,
+                self.dbg_gap_min,
+                self.dbg_gap_max,
+                self.dbg_skips,
+                self.dbg_probe_atlases(),
+            );
+            self.dbg_gap_min = 1e9;
+            self.dbg_gap_max = 0.0;
+        } else {
+            self.dbg_gap_min = self.dbg_gap_min.min(__gap);
+            self.dbg_gap_max = self.dbg_gap_max.max(__gap);
+        }
         let layer = match &self.layer {
             Some(l) => l,
             None => return,
@@ -243,7 +361,10 @@ impl App {
             let buffer = self.buffer.as_ref().unwrap();
             match pool.canvas(buffer) {
                 Some(c) => c,
-                None => return, // compositor still showing the previous frame
+                None => {
+                    self.dbg_skips += 1; // TEMP
+                    return; // compositor still showing the previous frame
+                }
             }
         };
 
@@ -252,17 +373,39 @@ impl App {
             return;
         }
 
-        layer.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
+        layer
+            .wl_surface()
+            .damage_buffer(0, 0, width as i32, height as i32);
         if let Err(err) = self.buffer.as_ref().unwrap().attach_to(layer.wl_surface()) {
             log::error!("failed to attach buffer: {err}");
             return;
         }
         layer.commit();
+
+        // TEMP INSTRUMENTATION: one line per drawn frame.
+        self.dbg_frames += 1;
+        if let Some(prev) = __tick {
+            let gap = __t0.duration_since(prev).as_secs_f64() * 1000.0;
+            let work = __t0.elapsed().as_secs_f64() * 1000.0;
+            if gap > self.dbg_target_ms * 1.35 || work > self.dbg_target_ms {
+                eprintln!(
+                    "DBGAP gap={gap:.2}ms work={work:.2}ms target={:.2}ms",
+                    self.dbg_target_ms
+                );
+            }
+        }
     }
 }
 
 impl CompositorHandler for App {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
     fn transform_changed(
         &mut self,
         _: &Connection,
@@ -272,8 +415,22 @@ impl CompositorHandler for App {
     ) {
     }
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
-    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl OutputHandler for App {
@@ -306,7 +463,17 @@ impl LayerShellHandler for App {
         if !self.configured {
             self.configured = true;
             self.source.init(self.width, self.height);
+            // The first battery reading happens before the first frame, so a
+            // wallpaper that boots on battery starts throttled.
+            self.on_battery = self.power_save.enabled && self.power.poll();
+            self.source.set_power_saving(self.on_battery);
+            if self.on_battery {
+                log::info!("running on battery: starting throttled");
+            }
             self.interval = self.source.tick_interval();
+            if let Some(i) = self.interval {
+                self.dbg_target_ms = i.as_secs_f64() * 1000.0;
+            }
             self.draw(qh);
         }
     }

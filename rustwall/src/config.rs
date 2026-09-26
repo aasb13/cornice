@@ -51,6 +51,66 @@ pub struct WallpaperConfig {
     /// back to the main font.
     #[serde(default)]
     pub waterfall_font_path: Option<String>,
+
+    /// What to dial back while the machine is running unplugged. See
+    /// [`PowerSaveConfig`].
+    #[serde(default)]
+    pub power_save: PowerSaveConfig,
+
+    /// Upper bound on how many times per second the wallpaper redraws.
+    /// `0` (the default) means no cap: frames are pushed as fast as the
+    /// compositor will take them, which is the monitor's refresh rate.
+    /// Capping below that is a straight CPU saving on high-refresh displays,
+    /// because rendering is redone from scratch every frame. The rain falls at
+    /// 180-440 px/s, so it reads the same at 60fps as at 144fps.
+    #[serde(default)]
+    pub fps_cap: u32,
+}
+
+/// Behaviour while the machine is running on battery: a laptop (or any box
+/// with a battery) that is not plugged in throttles the redraw rate and, for
+/// the Matrix rain, thins the rain out. Applied by `rustwall` itself, not by
+/// the source, so every `FrameSource` benefits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerSaveConfig {
+    /// Master switch. When false, `rustwall` ignores the battery entirely and
+    /// always runs at full speed.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Frame rate ceiling while on battery. `0` means "don't cap on battery",
+    /// leaving `fps_cap` (or the display's refresh rate) in charge.
+    #[serde(default = "default_battery_fps")]
+    pub fps_cap: u32,
+
+    /// Divide the rain's column count by this while on battery. The rain hands
+    /// out screen columns round-robin, so keeping every Nth wall thins it
+    /// evenly across the whole screen instead of punching holes in it.
+    /// `1` disables the thinning.
+    #[serde(default = "default_battery_rain_divisor")]
+    pub rain_divisor: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_battery_fps() -> u32 {
+    30
+}
+
+fn default_battery_rain_divisor() -> u32 {
+    4
+}
+
+impl Default for PowerSaveConfig {
+    fn default() -> Self {
+        PowerSaveConfig {
+            enabled: default_true(),
+            fps_cap: default_battery_fps(),
+            rain_divisor: default_battery_rain_divisor(),
+        }
+    }
 }
 
 fn default_source() -> String {
@@ -71,6 +131,8 @@ impl Default for WallpaperConfig {
             source: default_source(),
             font_path: None,
             waterfall_font_path: None,
+            fps_cap: 0,
+            power_save: PowerSaveConfig::default(),
         }
     }
 }
@@ -93,6 +155,20 @@ source = "cube3d"
 # Optional waterfall font for the cube3d source's rain glyphs.
 # If unset, falls back to the main font.
 # waterfall_font_path = "/usr/share/fonts/TTF/matrix code nfi.ttf"
+#
+# --- Performance ---
+# Cap on redraws per second. 0 (the default) means no cap: the wallpaper
+# redraws at your monitor's refresh rate. Setting e.g. 60 roughly halves CPU
+# on a 144Hz display, and the rain looks the same.
+# fps_cap = 60
+#
+# While running unplugged (a laptop on battery, not charging), the frame rate
+# drops to `power_save.fps_cap` and the rain is thinned to one column in
+# `power_save.rain_divisor`. Machines with no battery never enter this mode.
+# [wallpaper.power_save]
+# enabled = true
+# fps_cap = 30
+# rain_divisor = 4
 "#;
 
 /// Resolve the on-disk path to the config file:
@@ -142,6 +218,36 @@ mod tests {
     }
 
     #[test]
+    fn fps_cap_defaults_to_unlimited() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.wallpaper.fps_cap, 0);
+    }
+
+    #[test]
+    fn power_save_defaults_to_throttling_on_battery() {
+        let config: Config = toml::from_str("").unwrap();
+        let ps = &config.wallpaper.power_save;
+        assert!(ps.enabled);
+        assert_eq!(ps.fps_cap, 30);
+        assert_eq!(ps.rain_divisor, 4);
+    }
+
+    #[test]
+    fn power_save_is_overridable() {
+        let toml = r#"
+[wallpaper.power_save]
+enabled = false
+fps_cap = 24
+rain_divisor = 8
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let ps = &config.wallpaper.power_save;
+        assert!(!ps.enabled);
+        assert_eq!(ps.fps_cap, 24);
+        assert_eq!(ps.rain_divisor, 8);
+    }
+
+    #[test]
     fn parse_cube3d_with_font_overrides() {
         let toml = r#"
 [wallpaper]
@@ -151,7 +257,13 @@ waterfall_font_path = "/custom/matrix.ttf"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.wallpaper.source, "cube3d");
-        assert_eq!(config.wallpaper.font_path.as_deref(), Some("/usr/share/fonts/TTF/DejaVuSansMono.ttf"));
-        assert_eq!(config.wallpaper.waterfall_font_path.as_deref(), Some("/custom/matrix.ttf"));
+        assert_eq!(
+            config.wallpaper.font_path.as_deref(),
+            Some("/usr/share/fonts/TTF/DejaVuSansMono.ttf")
+        );
+        assert_eq!(
+            config.wallpaper.waterfall_font_path.as_deref(),
+            Some("/custom/matrix.ttf")
+        );
     }
 }

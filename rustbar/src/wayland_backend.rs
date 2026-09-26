@@ -220,10 +220,13 @@ pub fn run(monitor: Option<String>, bar_height: u32, mut clock: Box<Clock>) -> R
     hypr::spawn(hypr_tx);
     let qh_for_hypr = qh.clone();
     loop_handle
-        .insert_source(hypr_rx, move |event, _, app: &mut App| {
-            if let calloop::channel::Event::Msg(HyprEvent::WorkspaceChanged) = event {
+        .insert_source(hypr_rx, move |event, _, app: &mut App| match event {
+            calloop::channel::Event::Msg(HyprEvent::WorkspaceChanged) => app.draw(&qh_for_hypr),
+            calloop::channel::Event::Msg(HyprEvent::LayoutChanged) => {
+                app.widgets.refresh_language();
                 app.draw(&qh_for_hypr);
             }
+            _ => {}
         })
         .map_err(|e| anyhow!("failed to insert hyprland event source: {e}"))?;
 
@@ -637,7 +640,7 @@ impl PointerHandler for App {
                                 SegKind::Volume => spawn("pavucontrol", &[]),
                                 // waybar custom/notification `on-click: swaync -t`
                                 SegKind::Notification => spawn("swaync-client", &["-t"]),
-                                SegKind::Brightness | SegKind::Other => {}
+                                SegKind::Brightness | SegKind::Language | SegKind::Other => {}
                             }
                         } else {
                             self.close_menu();

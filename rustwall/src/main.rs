@@ -1,4 +1,5 @@
 mod config;
+mod power;
 mod source;
 mod sources;
 mod wayland_backend;
@@ -32,7 +33,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     let default_level = if args.debug { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level)).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
+        .init();
 
     let config = config::load()?;
 
@@ -42,7 +44,9 @@ fn main() -> Result<()> {
         Box::new(sources::cube3d::RotatingTesseract::new(
             wp.font_path.clone(),
             wp.waterfall_font_path.clone(),
+            wp.fps_cap,
+            wp.power_save.clone(),
         ));
 
-    wayland_backend::run(args.monitor, active_source)
+    wayland_backend::run(args.monitor, active_source, wp.power_save.clone())
 }

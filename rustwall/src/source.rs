@@ -39,7 +39,25 @@ pub trait FrameSource {
     /// - `Some(duration)`: `render` is called repeatedly, roughly every
     ///   `duration` (video, cava, a clock, anything that changes on its
     ///   own).
+    ///
+    /// rustwall re-reads this after every frame, so a source can change the
+    /// answer at runtime — that's how a frame-rate cap follows the display
+    /// refresh rate, or drops when the machine goes onto battery.
     fn tick_interval(&self) -> Option<Duration> {
         None
     }
+
+    /// TEMP INSTRUMENTATION: implementation-defined probe, returns 0 by default.
+    fn dbg_atlas_len(&self) -> usize {
+        0
+    }
+
+    /// Called when the machine's power state changes, so an animated source
+    /// can spend less effort: `on_battery` is true only while a battery
+    /// exists *and* is discharging (a desktop never gets this, and a plugged
+    /// in laptop gets `false` again).
+    ///
+    /// Implementations should return to full speed when handed `false` — this
+    /// is a temporary state, not a mode to latch. The default does nothing.
+    fn set_power_saving(&mut self, _on_battery: bool) {}
 }

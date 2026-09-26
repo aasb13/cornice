@@ -97,6 +97,10 @@ pub enum SegKind {
     Volume,
     /// waybar `backlight` — scroll: brightness ±.
     Brightness,
+    /// The keyboard-layout indicator (waybar `hyprland/language`). Read-only,
+    /// but it needs its own kind so a layout change can patch just this
+    /// segment instead of forcing a full strip rebuild.
+    Language,
 }
 
 pub struct WidgetStrip {
@@ -267,6 +271,27 @@ impl WidgetStrip {
         }
     }
 
+    /// Re-read ONLY the language segment and patch its cached label in place —
+    /// see `refresh_volume` for why this is targeted rather than a full strip
+    /// refresh. Called straight off Hyprland's `activelayout` event so the new
+    /// layout shows on the very next frame rather than after the periodic 1s
+    /// refresh (and its blocking `hyprctl` fork).
+    pub fn refresh_language(&mut self) {
+        let Some(label) = read_language() else { return };
+        if let Some((_, s)) = self
+            .cache
+            .iter_mut()
+            .find(|(kind, _)| *kind == SegKind::Language)
+        {
+            *s = label;
+        } else {
+            // No language segment cached yet (nothing has been rendered, or the
+            // last read failed) — clear the throttle so the next render does a
+            // full rebuild that includes the segment.
+            self.last_refresh = None;
+        }
+    }
+
     fn maybe_refresh(&mut self) {
         let now = Instant::now();
         if let Some(t) = self.last_refresh {
@@ -330,7 +355,7 @@ impl WidgetStrip {
         }
         // language (waybar: `{shortDescription}`)
         if let Some(lang) = read_language() {
-            segs.push((SegKind::Other, lang));
+            segs.push((SegKind::Language, lang));
         }
         // battery — mirrors waybar's format precedence:
         //   Charging   → format-charging  → "{cap}% "  (bolt)
@@ -605,11 +630,121 @@ fn parse_main_keymap(json: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// XKB layout names whose code differs from their base language, keyed by the
+/// *full* keymap name. These are the variants users actually see in Hyprland's
+/// layout list, where the country/variant is the meaningful part
+/// ("English (US)" is `us`, not `en`). Anything not listed falls through to
+/// `LANGUAGE_CODES` on the base name.
+const LAYOUT_VARIANT_CODES: &[(&str, &str)] = &[
+    ("English (US)", "us"),
+    ("English (UK)", "gb"),
+    ("English (US, intl., with dead keys)", "us"),
+    ("English (US, intl., with dead keys on 5-level compose)", "us"),
+    ("English (intl., with dead keys)", "gb"),
+    ("English (Russian)", "ru"),
+    ("Portuguese (Brazil)", "br"),
+    ("Spanish (Latin American)", "es"),
+    ("French (AZERTY)", "fr"),
+];
+
+/// XKB layout long name → ISO 639-1 code. This is the table
+/// `xkbcommon`'s `XkbLayoutInfo::short_description` is generated from, i.e.
+/// exactly what waybar's `{shortDescription}` renders — "Russian" → `ru`,
+/// not the full "russian" word.
+const LANGUAGE_CODES: &[(&str, &str)] = &[
+    ("Afrikaans", "af"),
+    ("Albanian", "sq"),
+    ("Amharic", "am"),
+    ("Arabic", "ar"),
+    ("Armenian", "hy"),
+    ("Azerbaijani", "az"),
+    ("Basque", "eu"),
+    ("Belarusian", "be"),
+    ("Bengali", "bn"),
+    ("Bosnian", "bs"),
+    ("Brazilian", "pt"),
+    ("Bulgarian", "bg"),
+    ("Burmese", "my"),
+    ("Catalan", "ca"),
+    ("Chinese", "zh"),
+    ("Croatian", "hr"),
+    ("Czech", "cs"),
+    ("Danish", "da"),
+    ("Dutch", "nl"),
+    ("English", "en"),
+    ("Esperanto", "eo"),
+    ("Estonian", "et"),
+    ("Faroese", "fo"),
+    ("Finnish", "fi"),
+    ("French", "fr"),
+    ("Galician", "gl"),
+    ("Georgian", "ka"),
+    ("German", "de"),
+    ("Greek", "el"),
+    ("Hebrew", "he"),
+    ("Hindi", "hi"),
+    ("Hungarian", "hu"),
+    ("Icelandic", "is"),
+    ("Indonesian", "id"),
+    ("Irish", "ga"),
+    ("Italian", "it"),
+    ("Japanese", "ja"),
+    ("Kannada", "kn"),
+    ("Kazakh", "kk"),
+    ("Khmer", "km"),
+    ("Korean", "ko"),
+    ("Kurdish", "ku"),
+    ("Lao", "lo"),
+    ("Latin American", "es"),
+    ("Latvian", "lv"),
+    ("Lithuanian", "lt"),
+    ("Macedonian", "mk"),
+    ("Malay", "ms"),
+    ("Malayalam", "ml"),
+    ("Maltese", "mt"),
+    ("Marathi", "mr"),
+    ("Mongolian", "mn"),
+    ("Nepali", "ne"),
+    ("Norwegian", "no"),
+    ("Persian", "fa"),
+    ("Polish", "pl"),
+    ("Portuguese", "pt"),
+    ("Punjabi", "pa"),
+    ("Romanian", "ro"),
+    ("Russian", "ru"),
+    ("Serbian", "sr"),
+    ("Sinhala", "si"),
+    ("Slovak", "sk"),
+    ("Slovenian", "sl"),
+    ("Spanish", "es"),
+    ("Swahili", "sw"),
+    ("Swedish", "sv"),
+    ("Tamil", "ta"),
+    ("Tatar", "tt"),
+    ("Telugu", "te"),
+    ("Thai", "th"),
+    ("Turkish", "tr"),
+    ("Ukrainian", "uk"),
+    ("Urdu", "ur"),
+    ("Uzbek", "uz"),
+    ("Vietnamese", "vi"),
+];
+
 /// Shorten a full keymap name to a layout code, mirroring waybar's
-/// `{shortDescription}` as closely as we can without xkbcommon: take the
-/// parenthetical if present ("English (US)" -> "us"), else the first word
-/// lowercased ("Russian" -> "russian").
+/// `{shortDescription}` without linking xkbcommon: look the name up in
+/// `LAYOUT_VARIANT_CODES` / `LANGUAGE_CODES` so it yields a real language code
+/// ("Russian" → "ru", "German (Neo)" → "de"), falling back to the old
+/// heuristic (parenthetical if present, else the first word) for names neither
+/// table knows.
 fn keymap_to_code(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some((_, code)) = LAYOUT_VARIANT_CODES.iter().find(|(name, _)| *name == raw) {
+        return (*code).to_string();
+    }
+    let base = raw.split('(').next().unwrap_or(raw).trim();
+    if let Some((_, code)) = LANGUAGE_CODES.iter().find(|(name, _)| *name == base) {
+        return (*code).to_string();
+    }
     if let Some(l) = raw.rfind('(') {
         let after = &raw[l + 1..];
         let close = after.find(')').unwrap_or(after.len());
@@ -800,7 +935,7 @@ mod tests {
   ]
 }"#;
         assert_eq!(parse_main_keymap(json).as_deref(), Some("Russian"));
-        assert_eq!(keymap_to_code(&parse_main_keymap(json).unwrap()), "russian");
+        assert_eq!(keymap_to_code(&parse_main_keymap(json).unwrap()), "ru");
     }
 
     #[test]
@@ -841,11 +976,19 @@ mod tests {
     }
 
     #[test]
-    fn keymap_to_code_parenthetical_and_first_word() {
+    fn keymap_to_code_uses_language_tables_then_falls_back() {
+        // Known language names collapse to their ISO 639-1 code.
+        assert_eq!(keymap_to_code("Russian"), "ru");
+        assert_eq!(keymap_to_code("Ukrainian"), "uk");
+        assert_eq!(keymap_to_code("French"), "fr");
+        // Variants prefer the variant table, then the base language.
         assert_eq!(keymap_to_code("English (US)"), "us");
-        assert_eq!(keymap_to_code("Russian"), "russian");
-        assert_eq!(keymap_to_code("English (US, intl., with dead keys)"),
-                   "us, intl., with dead keys");
+        assert_eq!(keymap_to_code("English (US, intl., with dead keys)"), "us");
+        assert_eq!(keymap_to_code("German (Neo)"), "de");
+        assert_eq!(keymap_to_code("French (AZERTY)"), "fr");
+        // Unknown names keep the old heuristic: parenthetical, else first word.
+        assert_eq!(keymap_to_code("Colemak"), "colemak");
+        assert_eq!(keymap_to_code("Dvorak (US)"), "us");
     }
 
     #[test]
