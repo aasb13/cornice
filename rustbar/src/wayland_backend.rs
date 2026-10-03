@@ -211,14 +211,13 @@ pub fn run(
         .insert(loop_handle.clone())
         .map_err(|e| anyhow!("failed to insert Wayland source: {e}"))?;
 
-    let qh_for_timer = qh.clone();
     let millis_into_second = chrono::Local::now().timestamp_subsec_millis() as u64;
     let until_next_second = std::time::Duration::from_millis(1000 - millis_into_second.min(999));
     loop_handle
         .insert_source(
             Timer::from_duration(until_next_second),
             move |_deadline, _, app: &mut App| {
-                app.draw(&qh_for_timer);
+                app.draw();
                 TimeoutAction::ToDuration(std::time::Duration::from_secs(1))
             },
         )
@@ -226,16 +225,15 @@ pub fn run(
 
     let (hypr_tx, hypr_rx) = calloop::channel::channel::<HyprEvent>();
     hypr::spawn(hypr_tx);
-    let qh_for_hypr = qh.clone();
     loop_handle
         .insert_source(hypr_rx, move |event, _, app: &mut App| match event {
             calloop::channel::Event::Msg(HyprEvent::Workspaces(state)) => {
                 app.workspaces.set_state(state);
-                app.draw(&qh_for_hypr);
+                app.draw();
             }
             calloop::channel::Event::Msg(HyprEvent::LayoutChanged) => {
                 app.widgets.refresh_language();
-                app.draw(&qh_for_hypr);
+                app.draw();
             }
             _ => {}
         })
@@ -247,22 +245,20 @@ pub fn run(
         tray_icons,
         tray_cmd_tx,
     ));
-    let qh_for_tray = qh.clone();
     loop_handle
         .insert_source(tray_rx, move |event, _, app: &mut App| {
             if let calloop::channel::Event::Msg(()) = event {
-                app.draw(&qh_for_tray);
+                app.draw();
             }
         })
         .map_err(|e| anyhow!("failed to insert tray event source: {e}"))?;
 
     // cava visualizer — a frame arrives ~120×/sec; each one triggers a redraw.
     let (cava_tx, cava_rx) = calloop::channel::channel::<()>();
-    let qh_for_cava = qh.clone();
     loop_handle
         .insert_source(cava_rx, move |event, _, app: &mut App| {
             if let calloop::channel::Event::Msg(()) = event {
-                app.draw(&qh_for_cava);
+                app.draw();
             }
         })
         .map_err(|e| anyhow!("failed to insert cava event source: {e}"))?;
@@ -278,7 +274,6 @@ pub fn run(
     // actually start watching. Gating the insertion on it instead would make
     // `watch = true` a no-op for the rest of the process's life.
     {
-        let qh_for_reload = qh.clone();
         loop_handle
             .insert_source(
                 Timer::from_duration(reload_interval),
@@ -288,7 +283,7 @@ pub fn run(
                     // one second's cadence and keeps the reload honest if a
                     // future option turns out to affect layout.
                     app.check_reload();
-                    app.draw(&qh_for_reload);
+                    app.draw();
                     TimeoutAction::ToDuration(app.reload.interval())
                 },
             )
@@ -376,7 +371,7 @@ impl App {
         }
     }
 
-    fn draw(&mut self, _qh: &QueueHandle<Self>) {
+    fn draw(&mut self) {
         let (width, height) = (self.width, self.height);
         if width == 0 || height == 0 {
             return;
@@ -562,7 +557,7 @@ impl LayerShellHandler for App {
     fn configure(
         &mut self,
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
@@ -578,7 +573,7 @@ impl LayerShellHandler for App {
                 self.height = h;
             }
             self.configured = true;
-            self.draw(qh);
+            self.draw();
         } else if self.menu.as_ref().map(|m| m.wl_surface()) == Some(surface) {
             // tray menu popup — now an xdg_popup, not a layer surface, so this
             // branch shouldn't fire for it; left as a no-op safety net.
@@ -751,7 +746,7 @@ impl PointerHandler for App {
                         let _ = tp.set_cursor(conn, icon);
                     }
                     if hover_changed {
-                        self.draw(qh);
+                        self.draw();
                     }
                 }
                 PointerEventKind::Press { button, serial, .. } => {
@@ -769,7 +764,7 @@ impl PointerHandler for App {
                         if let Some(id) = self.workspaces.hit_test(x) {
                             self.close_menu();
                             self.workspaces.switch_to(id);
-                            self.draw(qh);
+                            self.draw();
                         } else if let Some(item_id) = self
                             .tray
                             .as_ref()
@@ -807,7 +802,7 @@ impl PointerHandler for App {
                             // would otherwise lag by up to a second).
                             run_sync("swaync-client", &["-d"]);
                             self.widgets.refresh_notification();
-                            self.draw(qh);
+                            self.draw();
                         } else if let Some(tray) = &self.tray {
                             if let Some(item_id) = tray.hit_test(x).map(|s| s.to_string()) {
                                 let (menu_path, menu_items) = tray.menu_for(&item_id);
@@ -894,7 +889,7 @@ impl PointerHandler for App {
                             // cached values instead of re-sampling on every
                             // scroll tick.
                             self.widgets.refresh_volume();
-                            self.draw(qh);
+                            self.draw();
                         }
                         Some(SegKind::Brightness) => {
                             // waybar backlight default scroll: brightness ±step.
@@ -910,14 +905,14 @@ impl PointerHandler for App {
                             // re-read reflects the new brightness immediately (a
                             // detached spawn would race it).
                             self.widgets.refresh_brightness();
-                            self.draw(qh);
+                            self.draw();
                         }
                         _ => {}
                     }
                 }
                 PointerEventKind::Leave { .. } => {
                     if self.workspaces.clear_hover() {
-                        self.draw(qh);
+                        self.draw();
                     }
                 }
                 _ => {}
