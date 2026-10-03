@@ -24,8 +24,9 @@
 //! up far too slowly from there → bars stay at 0 even with music playing. With
 //! `autosens = 1` cava manages sensitivity dynamically from the default (100 →
 //! 1.0), which reproduces waybar's *intent* (autosens on) and actually works.
-//! `format-icons` and the box styling (transparent bg, 1px accent border, 8px
-//! h-padding) match `#cava` in CSS.
+//! `format-icons` and the box padding (8px h-padding, 1px accent border) match
+//! `#cava` in CSS, except the fill: waybar had `background: transparent` there
+//! and this bar gives cava the same background as every other module.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -36,7 +37,7 @@ use std::thread;
 use calloop::channel::Sender;
 use rusttype::{Font, Scale, point};
 
-use crate::theme::{accent, draw_border_only};
+use crate::theme::{accent, bg, draw_bordered_box};
 
 /// Number of bars (waybar `cava` `bars: 14`).
 const BARS: usize = 14;
@@ -169,7 +170,7 @@ impl Cava {
         self.child = Some(child);
     }
 
-    /// Render the `#cava` box (transparent fill + 1px accent border, 8px
+    /// Render the `#cava` box (background fill + 1px accent border, 8px
     /// h-padding) containing the latest frame's block glyphs, accent-colored.
     pub fn render(&mut self, canvas: &mut [u8], x_offset: u32, height: u32, stride: u32) {
         let font = match &self.font {
@@ -197,8 +198,9 @@ impl Cava {
         let box_w = 2 * BORDER + 2 * H_PAD + total_width.ceil() as u32;
         self.layout = (x_offset, x_offset + box_w);
 
-        // waybar `#cava`: transparent background, 1px accent border (no fill).
-        draw_border_only(canvas, stride, x_offset, 0, box_w, height, accent());
+        // Same filled-box primitive as the clock/workspaces/tray/widgets modules,
+        // so cava matches the rest of the bar instead of being the one hole.
+        draw_bordered_box(canvas, stride, x_offset, 0, box_w, height, bg(), accent());
 
         // Pen: 1px in from the border, 8px h-padding, vertically centered. The
         // block glyphs sit at the bottom of their cell, so bars grow upward from
@@ -223,7 +225,7 @@ impl Cava {
                         if off + 3 < canvas.len() {
                             // gamma-correct coverage + premultiplied src-over,
                             // same as the clock/workspaces text so accent
-                            // composites correctly over the transparent box.
+                            // composites correctly over the box fill.
                             let gv = v.powf(1.0 / 2.2);
                             let src = accent().bgr(); // b, g, r
                             for c in 0..3 {
