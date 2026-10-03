@@ -9,23 +9,29 @@
 
 use rusttype::Scale;
 use smithay_client_toolkit::{
-    compositor::{CompositorState, Surface},
+    compositor::{CompositorState, Surface, SurfaceData},
     shell::{
         wlr_layer::LayerSurface,
-        xdg::{XdgPositioner, XdgShell, popup::Popup},
+        xdg::{
+            XdgPositioner, XdgShell,
+            popup::{Popup, PopupData},
+        },
     },
     shm::{Shm, slot::SlotPool},
 };
 use wayland_client::{
-    QueueHandle,
-    protocol::{wl_seat::WlSeat, wl_shm},
+    Dispatch, QueueHandle,
+    protocol::{wl_seat::WlSeat, wl_shm, wl_surface::WlSurface},
 };
-use wayland_protocols::xdg::shell::client::xdg_positioner::{Anchor, Gravity};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup::XdgPopup,
+    xdg_positioner::{Anchor, Gravity},
+    xdg_surface::XdgSurface,
+};
 
 use crate::config::Colors;
 use crate::theme::{self, draw_text, text_width};
 use crate::tray::MenuItem;
-use crate::wayland_backend::App;
 
 const ROW_HEIGHT: u32 = 26;
 /// Font size for menu labels.
@@ -58,9 +64,15 @@ impl MenuPopup {
     /// is what the positioner uses). The menu is placed with its right edge at
     /// `click_x` and its top at the tray icon's bottom edge (`bar_height * 3/4`),
     /// dropping down just below the icon.
+    ///
+    /// `D` is whoever will receive the popup's protocol events — in practice
+    /// `wayland_backend::App`, which implements `PopupHandler`. It is a parameter
+    /// rather than a concrete type so this module doesn't have to name that one:
+    /// `wayland_backend` imports `MenuPopup`, and naming `App` back here made the
+    /// two modules import each other.
     #[allow(clippy::too_many_arguments)]
-    pub fn create(
-        qh: &QueueHandle<App>,
+    pub fn create<D>(
+        qh: &QueueHandle<D>,
         compositor_state: &CompositorState,
         xdg_shell: &XdgShell,
         shm: &Shm,
@@ -72,7 +84,13 @@ impl MenuPopup {
         items: Vec<MenuItem>,
         click_x: i32,
         bar_height: u32,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Self>
+    where
+        D: Dispatch<WlSurface, SurfaceData>
+            + Dispatch<XdgSurface, PopupData>
+            + Dispatch<XdgPopup, PopupData>
+            + 'static,
+    {
         let height = (items.len() as u32 * ROW_HEIGHT).max(ROW_HEIGHT);
 
         // The popup is sized to its labels up front, because the SHM buffer is

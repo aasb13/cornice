@@ -316,7 +316,7 @@ pub fn run(
     Ok(())
 }
 
-pub(crate) struct App {
+struct App {
     registry_state: RegistryState,
     output_state: OutputState,
     seat_state: SeatState,
