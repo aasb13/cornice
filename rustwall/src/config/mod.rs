@@ -77,8 +77,12 @@ pub struct Config {
 
 /// Behaviour while the machine is running on battery: a laptop (or any box
 /// with a battery) that is not plugged in throttles the redraw rate and, for
-/// the Matrix rain, thins the rain out. Applied by `rustwall` itself, not by
-/// the source, so every `FrameSource` benefits.
+/// the Matrix rain, thins the rain out.
+///
+/// The backend resolves this against the battery (see
+/// [`PowerSaveConfig::resolve`]) and hands the source a [`PowerState`]; the
+/// source decides *what* to scale rather than knowing about `[power_save]` or
+/// sysfs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PowerSaveConfig {
@@ -101,15 +105,65 @@ pub struct PowerSaveConfig {
 }
 
 impl PowerSaveConfig {
-    /// Whether the battery should be throttling the wallpaper, given whether a
-    /// battery is currently discharging.
+    /// Resolve against whether a battery is discharging.
     ///
-    /// `enabled` is the master switch and is deliberately part of this
-    /// calculation rather than checked by the caller: turning it off has to be
-    /// able to *stop* power saving on a machine that is still unplugged, so the
-    /// switch cannot be treated as "only affects future transitions".
-    pub fn effective_on_battery(&self, discharging: bool) -> bool {
-        self.enabled && discharging
+    /// `enabled` is folded in here rather than left to the caller: turning it off
+    /// has to be able to *stop* power saving on a machine that is still
+    /// unplugged, so the switch cannot be treated as "only affects future
+    /// transitions".
+    ///
+    /// Not throttling resolves to [`PowerState::default`] and nothing else, so
+    /// the two numbers in it are absent rather than merely ignored. That makes
+    /// "not throttling" a fixed point: retuning the battery cap while plugged in
+    /// resolves to the same state it already had, so it doesn't look like a
+    /// change the source needs telling about. It also makes [`PowerState::default`]
+    /// a true starting state rather than one that differs from any real reading.
+    ///
+    /// The backend resolves on every check and compares against what the source
+    /// was last told, so *any* change that matters — the switch, or the numbers
+    /// while the machine is still unplugged — reaches the source.
+    pub fn resolve(&self, discharging: bool) -> PowerState {
+        if self.enabled && discharging {
+            PowerState {
+                throttling: true,
+                fps_cap: self.fps_cap,
+                density_divisor: self.rain_divisor,
+            }
+        } else {
+            PowerState::default()
+        }
+    }
+}
+
+/// How hard to scale back, resolved against the machine's actual battery.
+///
+/// This is what a `FrameSource` is handed: the backend resolves `[power_save]`
+/// and the battery together and passes the answer down, so a source never reads
+/// the table or the sysfs itself, and every source is treated the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerState {
+    /// Whether to scale back at all. While false this is exactly
+    /// [`PowerState::default`] and the two numbers below are absent.
+    pub throttling: bool,
+    /// Frame-rate ceiling while throttling. `0` means "don't cap on battery",
+    /// leaving the source's own limit in charge.
+    pub fps_cap: u32,
+    /// Scale animated content down to every Nth unit while throttling; `1`
+    /// disables thinning. `rain_divisor` in the config is one interpretation of
+    /// this — divide the rain's column count by it — named generically here so
+    /// the trait contract isn't specific to one source's content.
+    pub density_divisor: u32,
+}
+
+impl Default for PowerState {
+    /// Not throttling, and nothing to scale: the state a machine on mains, or on
+    /// a desktop with no battery, is always in.
+    fn default() -> Self {
+        PowerState {
+            throttling: false,
+            fps_cap: 0,
+            density_divisor: 1,
+        }
     }
 }
 
@@ -239,6 +293,58 @@ rain_divisor = 8
         assert!(!ps.enabled);
         assert_eq!(ps.fps_cap, 24);
         assert_eq!(ps.rain_divisor, 8);
+    }
+
+    /// Resolving has to be a fixed point when not throttling, because the backend
+    /// compares each resolution against the last to decide whether the source
+    /// needs telling. If "not throttling" carried the configured numbers, then
+    /// retuning `[power_save]` while plugged in would look like a change and wake
+    /// the source for nothing — and the starting value would differ from any real
+    /// reading, firing one spurious wakeup at startup.
+    #[test]
+    fn not_throttling_resolves_to_the_default_however_the_config_is_set() {
+        for ps in [
+            PowerSaveConfig::default(),
+            PowerSaveConfig {
+                enabled: true,
+                fps_cap: 15,
+                rain_divisor: 8,
+            },
+            PowerSaveConfig {
+                enabled: false,
+                fps_cap: 30,
+                rain_divisor: 4,
+            },
+        ] {
+            // On mains, whatever the numbers say.
+            assert_eq!(ps.resolve(false), PowerState::default(), "on mains: {ps:?}");
+            // Unplugged, the switch alone decides.
+            assert_eq!(ps.resolve(true).throttling, ps.enabled, "unplugged: {ps:?}");
+            if !ps.enabled {
+                assert_eq!(ps.resolve(true), PowerState::default(), "{ps:?}");
+            }
+        }
+    }
+
+    /// Unplugged, the numbers come through — that is the whole point of
+    /// resolving, and what a retune while on battery has to be able to change.
+    #[test]
+    fn resolving_while_unplugged_carries_the_configured_budget() {
+        let ps = PowerSaveConfig {
+            enabled: true,
+            fps_cap: 15,
+            rain_divisor: 8,
+        };
+        assert_eq!(
+            ps.resolve(true),
+            PowerState {
+                throttling: true,
+                fps_cap: 15,
+                density_divisor: 8,
+            }
+        );
+        // And a retune is a different state, so it reaches the source.
+        assert_ne!(ps.resolve(true), PowerSaveConfig::default().resolve(true));
     }
 
     /// The generated template is only useful if it round-trips: every key in it

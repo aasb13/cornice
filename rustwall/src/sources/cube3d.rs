@@ -22,9 +22,7 @@
 //!   * A wall's per-slot colour and brightness are precomputed when it spawns,
 //!     so the draw path is a lookup rather than a lerp and a `powi` per glyph.
 
-use crate::config::{
-    Color, Config, Cube3dConfig, FONT_PATHS, PowerSaveConfig, WATERFALL_FONT_PATH,
-};
+use crate::config::{Color, Config, Cube3dConfig, FONT_PATHS, PowerState, WATERFALL_FONT_PATH};
 use crate::source::FrameSource;
 use rusttype::{Font, Scale, point};
 use std::collections::HashMap;
@@ -193,11 +191,9 @@ pub struct RotatingTesseract {
     /// Redraws per second ceiling; 0 = no cap (as fast as the compositor
     /// takes frames, i.e. the monitor's refresh rate).
     fps_cap: u32,
-    /// What to scale back to while the machine is unplugged, from config.
-    power_save: PowerSaveConfig,
-    /// True while the machine is unplugged: the frame rate drops and the rain
-    /// thins out. Driven by `set_power_saving`.
-    power_saving: bool,
+    /// The power budget the backend resolved, and the only place this source
+    /// learns it is throttling. It does not read `[power_save]` itself.
+    power: PowerState,
     start_time: Instant,
     width: u32,
     height: u32,
@@ -236,7 +232,7 @@ pub struct RotatingTesseract {
 }
 
 impl RotatingTesseract {
-    pub fn new(cfg: Cube3dConfig, fps_cap: u32, power_save: PowerSaveConfig) -> Self {
+    pub fn new(cfg: Cube3dConfig, fps_cap: u32) -> Self {
         let seed = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -252,8 +248,7 @@ impl RotatingTesseract {
             vertex_index,
             rain_glyphs,
             fps_cap,
-            power_save,
-            power_saving: false,
+            power: PowerState::default(),
             start_time: Instant::now(),
             width: 0,
             height: 0,
@@ -299,7 +294,6 @@ impl RotatingTesseract {
         let needs_rebuild = old.rasterization_key() != wall.cube3d.rasterization_key();
         self.cfg = wall.cube3d.clone();
         self.fps_cap = wall.fps_cap;
-        self.power_save = wall.power_save.clone();
 
         if needs_rebuild {
             let (w, h) = (self.width, self.height);
@@ -1088,26 +1082,26 @@ impl RotatingTesseract {
 
 impl RotatingTesseract {
     /// The frame-rate ceiling in force right now. On battery the ceiling drops
-    /// to `power_save.fps_cap`; a battery cap of 0 means "don't cap on
+    /// to the budget's `fps_cap`; a battery cap of 0 means "don't cap on
     /// battery", leaving `fps_cap` (or the display's refresh rate) in charge.
     fn fps_cap_now(&self) -> u32 {
-        if self.power_saving && self.power_save.fps_cap > 0 {
-            self.power_save.fps_cap
+        if self.power.throttling && self.power.fps_cap > 0 {
+            self.power.fps_cap
         } else {
             self.fps_cap
         }
     }
 
     /// Whether the rain wall at `index` should be drawn this frame. While
-    /// power saving only every `power_save.rain_divisor`th wall is: walls are
+    /// throttling only every `power.density_divisor`th wall is: walls are
     /// handed screen columns round-robin, so stepping through the list thins
     /// the rain evenly over the whole screen instead of punching holes in it.
     /// The walls that are skipped keep falling and mutating, so full speed
     /// comes back instantly on the next frame after plugging in.
     #[inline]
     fn rain_wall_drawn(&self, index: usize) -> bool {
-        let step = if self.power_saving {
-            self.power_save.rain_divisor
+        let step = if self.power.throttling {
+            self.power.density_divisor
         } else {
             1
         };
@@ -1223,8 +1217,8 @@ impl FrameSource for RotatingTesseract {
         Some(Duration::from_micros(6000))
     }
 
-    fn set_power_saving(&mut self, on_battery: bool) {
-        self.power_saving = on_battery;
+    fn set_power_saving(&mut self, state: PowerState) {
+        self.power = state;
     }
 
     fn reconfigure(&mut self, config: &crate::config::Config, _width: u32, _height: u32) {
@@ -1409,6 +1403,7 @@ impl FrameSource for RotatingTesseract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PowerSaveConfig;
     use crate::config::cube3d::{F32Range, RainConfig, U32Range};
 
     /// End-to-end check that a configured colour lands in the right channel.
@@ -1489,7 +1484,7 @@ mod tests {
     /// clean frame).
     #[test]
     fn tesseract_cell_grid_is_reset_every_frame() {
-        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0);
         s.init(1920, 1080);
         if s.font.is_none() {
             // No system font in this environment; nothing to render.
@@ -1572,7 +1567,7 @@ mod tests {
     /// take effect, and the animation keeps running rather than restarting.
     #[test]
     fn reconfigure_applies_live_without_restarting_the_animation() {
-        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0);
         s.init(1920, 1080);
         if s.font.is_none() {
             // No system font in this environment; nothing to render.
@@ -1603,7 +1598,7 @@ mod tests {
     /// what a user editing those keys actually does.
     #[test]
     fn a_rebuild_reload_keeps_the_rotation_clock_running() {
-        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0);
         s.init(1920, 1080);
         if s.font.is_none() {
             // No system font in this environment; nothing to rasterize.
@@ -1631,7 +1626,7 @@ mod tests {
     /// otherwise turning it back on would resurrect a stale population.
     #[test]
     fn reconfigure_can_switch_the_rain_off_and_on() {
-        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0);
         s.init(1920, 1080);
         if s.font.is_none() {
             return;
@@ -1695,8 +1690,7 @@ mod tests {
     /// since that is one of the reasons to reload rather than restart.
     #[test]
     fn reconfigure_applies_a_new_fps_cap() {
-        let mut s =
-            RotatingTesseract::new(Cube3dConfig::default(), 144, PowerSaveConfig::default());
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 144);
         s.init(640, 480);
         if s.font.is_none() {
             return;
@@ -1717,8 +1711,7 @@ mod tests {
     /// paces the redraw loop to exactly that many frames per second.
     #[test]
     fn tick_interval_honours_fps_cap() {
-        let mut capped =
-            RotatingTesseract::new(Cube3dConfig::default(), 60, PowerSaveConfig::default());
+        let mut capped = RotatingTesseract::new(Cube3dConfig::default(), 60);
         capped.init(640, 480);
         if capped.font.is_none() {
             // No system font in this environment; nothing to pace.
@@ -1729,10 +1722,21 @@ mod tests {
             Some(Duration::from_secs_f64(1.0 / 60.0))
         );
 
-        let mut uncapped =
-            RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
+        let mut uncapped = RotatingTesseract::new(Cube3dConfig::default(), 0);
         uncapped.init(640, 480);
         assert_eq!(uncapped.tick_interval(), Some(Duration::from_micros(6000)));
+    }
+
+    /// The budget the backend would hand over for a given battery reading.
+    /// Going through [`PowerSaveConfig::resolve`] rather than inventing a
+    /// `PowerState` keeps these tests on the same path the real caller uses.
+    fn budget(enabled: bool, fps_cap: u32, divisor: u32, discharging: bool) -> PowerState {
+        PowerSaveConfig {
+            enabled,
+            fps_cap,
+            rain_divisor: divisor,
+        }
+        .resolve(discharging)
     }
 
     /// Going onto battery must drop to the battery frame rate, and plugging
@@ -1740,20 +1744,15 @@ mod tests {
     /// stuck at 30fps forever.
     #[test]
     fn power_saving_drops_and_restores_the_frame_rate() {
-        let ps = PowerSaveConfig {
-            enabled: true,
-            fps_cap: 30,
-            rain_divisor: 4,
-        };
-        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60, ps);
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60);
         s.init(640, 480);
         if s.font.is_none() {
             return;
         }
         let on_mains = s.tick_interval();
-        s.set_power_saving(true);
+        s.set_power_saving(budget(true, 30, 4, true));
         let on_battery = s.tick_interval();
-        s.set_power_saving(false);
+        s.set_power_saving(budget(true, 30, 4, false));
         let restored = s.tick_interval();
 
         assert_eq!(on_mains, Some(Duration::from_secs_f64(1.0 / 60.0)));
@@ -1764,17 +1763,12 @@ mod tests {
     /// A battery frame-rate cap of 0 means "leave the normal cap alone".
     #[test]
     fn zero_battery_fps_cap_keeps_the_normal_cap() {
-        let ps = PowerSaveConfig {
-            enabled: true,
-            fps_cap: 0,
-            rain_divisor: 4,
-        };
-        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60, ps);
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60);
         s.init(640, 480);
         if s.font.is_none() {
             return;
         }
-        s.set_power_saving(true);
+        s.set_power_saving(budget(true, 0, 4, true));
         assert_eq!(s.tick_interval(), Some(Duration::from_secs_f64(1.0 / 60.0)));
     }
 
@@ -1782,22 +1776,17 @@ mod tests {
     /// are spread right across the screen rather than clustered.
     #[test]
     fn power_saving_thins_the_rain_evenly() {
-        let ps = PowerSaveConfig {
-            enabled: true,
-            fps_cap: 30,
-            rain_divisor: 4,
-        };
-        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60, ps);
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60);
 
         // On mains: everything.
-        s.set_power_saving(false);
+        s.set_power_saving(budget(true, 30, 4, false));
         assert!(
             (0..64).all(|i| s.rain_wall_drawn(i)),
             "no thinning on mains"
         );
 
         // On battery: one in four, spread out.
-        s.set_power_saving(true);
+        s.set_power_saving(budget(true, 30, 4, true));
         let kept: Vec<usize> = (0..64).filter(|&i| s.rain_wall_drawn(i)).collect();
         assert_eq!(
             kept,
@@ -1810,17 +1799,39 @@ mod tests {
     #[test]
     fn rain_divisor_of_one_keeps_everything() {
         for divisor in [0, 1] {
-            let ps = PowerSaveConfig {
-                enabled: true,
-                fps_cap: 30,
-                rain_divisor: divisor,
-            };
-            let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60, ps);
-            s.set_power_saving(true);
+            let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60);
+            s.set_power_saving(budget(true, 30, divisor, true));
             assert!(
                 (0..32).all(|i| s.rain_wall_drawn(i)),
                 "divisor {divisor} dropped rain"
             );
         }
+    }
+
+    /// This source has no config of its own for power: every number it uses
+    /// arrives in the `PowerState` the backend resolves. If it ever reads
+    /// `[power_save]` directly again, that duplication is the bug this pins.
+    #[test]
+    fn the_budget_is_the_only_power_input() {
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60);
+        s.init(640, 480);
+        if s.font.is_none() {
+            return;
+        }
+
+        // Retuning the battery cap while unplugged changes nothing until the
+        // backend says so — the source has no config copy that could apply it on
+        // its own.
+        s.set_power_saving(budget(true, 30, 4, true));
+        assert_eq!(s.tick_interval(), Some(Duration::from_secs_f64(1.0 / 30.0)));
+
+        s.set_power_saving(budget(true, 15, 8, true));
+        assert_eq!(
+            s.tick_interval(),
+            Some(Duration::from_secs_f64(1.0 / 15.0)),
+            "a retuned budget must take effect when handed over"
+        );
+        assert!(!s.rain_wall_drawn(4), "and the new divisor too");
+        assert!(s.rain_wall_drawn(8));
     }
 }

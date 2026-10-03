@@ -47,14 +47,20 @@ pub trait FrameSource {
         None
     }
 
-    /// Called when the machine's power state changes, so an animated source
-    /// can spend less effort: `on_battery` is true only while a battery
-    /// exists *and* is discharging (a desktop never gets this, and a plugged
-    /// in laptop gets `false` again).
+    /// Called when the power budget changes — the machine's battery state, the
+    /// `[power_save]` settings, or both — so an animated source can spend less
+    /// effort.
     ///
-    /// Implementations should return to full speed when handed `false` — this
-    /// is a temporary state, not a mode to latch. The default does nothing.
-    fn set_power_saving(&mut self, _on_battery: bool) {}
+    /// `state.throttling` is true only while a battery exists *and* is
+    /// discharging *and* power saving is enabled: a desktop never gets this, and
+    /// a plugged-in laptop gets `false` again.
+    ///
+    /// Implementations must return to full speed when handed `throttling: false`
+    /// — that is a temporary state, not a mode to latch. The rest of the struct
+    /// says how hard to scale back while it is true, and is ignored otherwise, so
+    /// a source that draws nothing animated can leave this alone. The default
+    /// does nothing.
+    fn set_power_saving(&mut self, _state: crate::config::PowerState) {}
 
     /// Apply a freshly-loaded config, live, without restarting the process.
     ///

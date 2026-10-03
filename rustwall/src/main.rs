@@ -97,7 +97,6 @@ fn main() -> Result<()> {
         "cube3d" => Box::new(sources::cube3d::RotatingTesseract::new(
             wp.cube3d.clone(),
             wp.fps_cap,
-            wp.power_save.clone(),
         )),
         other => bail!("unknown wallpaper source {other:?}"),
     };
