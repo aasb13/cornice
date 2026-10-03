@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use rusttype::{Font, Scale, point};
 
-use crate::theme::{draw_bordered_box, ACCENT, BG};
+use crate::theme::{accent, bg, draw_bordered_box};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 const BORDER: u32 = 1;
@@ -36,8 +36,8 @@ const ICON_VOL_MUTE: char = '\u{f466}';
 const ICON_CPU: char = '\u{f2db}';
 const ICON_TEMP: char = '\u{f2c9}';
 const ICON_MEM: char = '\u{f0c9}';
-const ICON_BAT_CHARGE: char = '\u{f0084}';  // waybar format-charging
-const ICON_BAT_PLUG: char = '\u{f17e2}';    // waybar format-plugged
+const ICON_BAT_CHARGE: char = '\u{f0084}'; // waybar format-charging
+const ICON_BAT_PLUG: char = '\u{f17e2}'; // waybar format-plugged
 // Notification — waybar custom/notification format-icons. `none`/`notification`
 // use the bell (0xf0a2); dnd states use bell-off (0xf1f7); a notification present
 // adds the red dot (0xf444). (Pango <span> markup can't be rendered here, so the
@@ -194,7 +194,7 @@ impl WidgetStrip {
 
         // One seamless box for the whole strip (waybar stats: black bg, 1px
         // accent border; left cap on the first segment, right cap on the last).
-        draw_bordered_box(canvas, stride, box_x, 0, box_w, height, BG, ACCENT);
+        draw_bordered_box(canvas, stride, box_x, 0, box_w, height, bg(), accent());
 
         let mut x = box_x + BORDER;
         let y = (height as f32 - glyph_height) / 2.0 + v_metrics.ascent;
@@ -205,7 +205,9 @@ impl WidgetStrip {
             // Text centered within the segment by construction: seg_w =
             // text_w + 2*H_PAD, so pen_x = seg_x + H_PAD leaves equal padding.
             let pen_x = x as f32 + H_PAD as f32;
-            draw_text(font, scale, canvas, stride, bar_width, height, label, pen_x, y);
+            draw_text(
+                font, scale, canvas, stride, bar_width, height, label, pen_x, y,
+            );
             self.layout.push((*kind, x, x + w));
             x += w;
         }
@@ -417,7 +419,7 @@ fn draw_text(
                     let off = yi as usize * stride as usize + xi as usize * 4;
                     if off + 3 < canvas.len() {
                         let gv = v.powf(1.0 / 2.2);
-                        let src = [ACCENT.2 as f32, ACCENT.1 as f32, ACCENT.0 as f32]; // b, g, r
+                        let src = accent().bgr();
                         for c in 0..3 {
                             let s = src[c] * gv;
                             let d = canvas[off + c] as f32;
@@ -443,12 +445,23 @@ fn read_notif() -> Option<(u32, bool)> {
     // which return immediately. (The `-sw` flag = "skip wait" so it doesn't
     // hang if swaync isn't running.)
     let count = {
-        let out = Command::new("swaync-client").args(["-c", "-sw"]).output().ok()?;
-        String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().ok()?
+        let out = Command::new("swaync-client")
+            .args(["-c", "-sw"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok()?
     };
     let dnd = {
-        let out = Command::new("swaync-client").args(["-D", "-sw"]).output().ok()?;
-        String::from_utf8_lossy(&out.stdout).trim().eq_ignore_ascii_case("true")
+        let out = Command::new("swaync-client")
+            .args(["-D", "-sw"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .eq_ignore_ascii_case("true")
     };
     Some((count, dnd))
 }
@@ -468,7 +481,10 @@ fn notification_label() -> Option<String> {
 }
 
 fn read_volume() -> Option<(u8, bool)> {
-    let out = Command::new("wpctl").args(["get-volume", "@DEFAULT_AUDIO_SINK@"]).output().ok()?;
+    let out = Command::new("wpctl")
+        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+        .output()
+        .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     let muted = s.contains("MUTED");
     let pct = s
@@ -488,7 +504,10 @@ fn read_cpu(prev: &mut Option<(u64, u64)>) -> Option<u8> {
     if fields.is_empty() || fields[0] != "cpu" {
         return None;
     }
-    let nums: Vec<u64> = fields[1..].iter().filter_map(|s| s.parse::<u64>().ok()).collect();
+    let nums: Vec<u64> = fields[1..]
+        .iter()
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
     if nums.len() < 4 {
         return None;
     }
@@ -498,7 +517,11 @@ fn read_cpu(prev: &mut Option<(u64, u64)>) -> Option<u8> {
         Some((p_idle, p_total)) => {
             let dt = total.saturating_sub(*p_total);
             let di = idle.saturating_sub(*p_idle);
-            if dt == 0 { 0 } else { ((dt - di) * 100 / dt) as u8 }
+            if dt == 0 {
+                0
+            } else {
+                ((dt - di) * 100 / dt) as u8
+            }
         }
         None => 0,
     };
@@ -530,9 +553,15 @@ fn read_ram() -> Option<u8> {
     let mut avail = None;
     for line in s.lines() {
         if line.starts_with("MemTotal:") {
-            total = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+            total = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok());
         } else if line.starts_with("MemAvailable:") {
-            avail = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok());
+            avail = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok());
         }
     }
     let total = total?;
@@ -544,9 +573,20 @@ fn read_ram() -> Option<u8> {
 }
 
 fn read_brightness() -> Option<u8> {
-    let dev = fs::read_dir("/sys/class/backlight").ok()?.flatten().next()?;
-    let b = fs::read_to_string(dev.path().join("brightness")).ok()?.trim().parse::<u64>().ok()?;
-    let m = fs::read_to_string(dev.path().join("max_brightness")).ok()?.trim().parse::<u64>().ok()?;
+    let dev = fs::read_dir("/sys/class/backlight")
+        .ok()?
+        .flatten()
+        .next()?;
+    let b = fs::read_to_string(dev.path().join("brightness"))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let m = fs::read_to_string(dev.path().join("max_brightness"))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
     if m == 0 {
         return None;
     }
@@ -590,7 +630,10 @@ fn brightness_label() -> Option<String> {
 }
 
 fn read_language() -> Option<String> {
-    let out = Command::new("hyprctl").args(["devices", "-j"]).output().ok()?;
+    let out = Command::new("hyprctl")
+        .args(["devices", "-j"])
+        .output()
+        .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     Some(keymap_to_code(&parse_main_keymap(&s)?))
 }
@@ -639,7 +682,10 @@ const LAYOUT_VARIANT_CODES: &[(&str, &str)] = &[
     ("English (US)", "us"),
     ("English (UK)", "gb"),
     ("English (US, intl., with dead keys)", "us"),
-    ("English (US, intl., with dead keys on 5-level compose)", "us"),
+    (
+        "English (US, intl., with dead keys on 5-level compose)",
+        "us",
+    ),
     ("English (intl., with dead keys)", "gb"),
     ("English (Russian)", "ru"),
     ("Portuguese (Brazil)", "br"),
@@ -760,7 +806,11 @@ fn read_battery() -> Option<(u8, String)> {
         .flatten()
         .find(|e| e.file_name().to_string_lossy().starts_with("BAT"))?;
     let base = bat.path();
-    let cap = fs::read_to_string(base.join("capacity")).ok()?.trim().parse::<u8>().ok()?;
+    let cap = fs::read_to_string(base.join("capacity"))
+        .ok()?
+        .trim()
+        .parse::<u8>()
+        .ok()?;
     let mut status = fs::read_to_string(base.join("status"))
         .ok()?
         .trim()
@@ -848,7 +898,12 @@ fn pick_iface(wireless: bool) -> Option<String> {
 
 /// Wifi label: just the signal-strength icon (waybar `custom/bandwidth_wlan0`
 /// `text` is the icon only — the rate goes in the hover tooltip, not the bar).
-fn wifi_label(iface: &str, _cur: &HashMap<String, (u64, u64)>, _prev: &HashMap<String, (u64, u64)>, _dt: f64) -> Option<String> {
+fn wifi_label(
+    iface: &str,
+    _cur: &HashMap<String, (u64, u64)>,
+    _prev: &HashMap<String, (u64, u64)>,
+    _dt: f64,
+) -> Option<String> {
     if !operstate_up(iface) {
         return Some(ICON_WIFI_OFF.to_string());
     }
@@ -869,7 +924,12 @@ fn wifi_label(iface: &str, _cur: &HashMap<String, (u64, u64)>, _prev: &HashMap<S
 
 /// Ethernet label: just the connected/disconnected icon (waybar
 /// `custom/bandwidth_enp3s0` `text` is the icon only — rate is in tooltip).
-fn eth_label(iface: &str, _cur: &HashMap<String, (u64, u64)>, _prev: &HashMap<String, (u64, u64)>, _dt: f64) -> Option<String> {
+fn eth_label(
+    iface: &str,
+    _cur: &HashMap<String, (u64, u64)>,
+    _prev: &HashMap<String, (u64, u64)>,
+    _dt: f64,
+) -> Option<String> {
     if !operstate_up(iface) {
         return Some(ICON_ETH_OFF.to_string());
     }
@@ -1019,6 +1079,9 @@ mod tests {
     fn fmt_brightness_delegates_to_brightness_icon() {
         assert_eq!(fmt_brightness(0), format!("0% {}", brightness_icon(0)));
         assert_eq!(fmt_brightness(50), format!("50% {}", brightness_icon(50)));
-        assert_eq!(fmt_brightness(100), format!("100% {}", brightness_icon(100)));
+        assert_eq!(
+            fmt_brightness(100),
+            format!("100% {}", brightness_icon(100))
+        );
     }
 }

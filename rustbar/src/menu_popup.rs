@@ -16,10 +16,13 @@ use smithay_client_toolkit::{
     },
     shm::{Shm, slot::SlotPool},
 };
-use wayland_client::{QueueHandle, protocol::{wl_seat::WlSeat, wl_shm}};
+use wayland_client::{
+    QueueHandle,
+    protocol::{wl_seat::WlSeat, wl_shm},
+};
 use wayland_protocols::xdg::shell::client::xdg_positioner::{Anchor, Gravity};
 
-use crate::theme::{ACCENT, BG, BG_HOVER};
+use crate::theme::{accent, bg, bg_hover};
 use crate::tray::MenuItem;
 use crate::wayland_backend::App;
 
@@ -193,15 +196,17 @@ impl MenuPopup {
 
         for (row, item) in self.items.iter().enumerate() {
             let y0 = row as u32 * ROW_HEIGHT;
-            let (bg_r, bg_g, bg_b) = if Some(row) == self.hovered { BG_HOVER } else { BG };
+            let row_bg = if Some(row) == self.hovered {
+                bg_hover()
+            } else {
+                bg()
+            }
+            .to_bgra(255);
             for y in y0..y0 + ROW_HEIGHT {
                 for x in 0..self.width {
                     let off = (y * stride as u32 + x * 4) as usize;
                     if off + 3 < canvas.len() {
-                        canvas[off] = bg_b;
-                        canvas[off + 1] = bg_g;
-                        canvas[off + 2] = bg_r;
-                        canvas[off + 3] = 255;
+                        canvas[off..off + 4].copy_from_slice(&row_bg);
                     }
                 }
             }
@@ -209,8 +214,8 @@ impl MenuPopup {
             if let Some(font) = &self.font {
                 let scale = Scale::uniform(FONT_SIZE);
                 let v_metrics = font.v_metrics(scale);
-                let pen_y = y0 as f32
-                    + (ROW_HEIGHT as f32 + v_metrics.ascent + v_metrics.descent) / 2.0;
+                let pen_y =
+                    y0 as f32 + (ROW_HEIGHT as f32 + v_metrics.ascent + v_metrics.descent) / 2.0;
                 let text_width = label_width(font, scale, &item.label);
                 let mut pen = point((self.width as f32 - text_width) / 2.0, pen_y);
                 for c in item.label.chars() {
@@ -221,18 +226,23 @@ impl MenuPopup {
                         positioned.draw(|xr, yr, v| {
                             let xi = bb.min.x + xr as i32;
                             let yi = bb.min.y + yr as i32;
-                            if xi >= 0 && yi >= 0 && (xi as u32) < self.width && (yi as u32) < self.height {
+                            if xi >= 0
+                                && yi >= 0
+                                && (xi as u32) < self.width
+                                && (yi as u32) < self.height
+                            {
                                 let off = (yi as u32 * stride as u32 + xi as u32 * 4) as usize;
                                 if off + 3 < canvas.len() {
                                     let gv = v.powf(1.0 / 2.2);
-                                    let src = [ACCENT.2 as f32, ACCENT.1 as f32, ACCENT.0 as f32];
+                                    let src = accent().bgr();
                                     for c in 0..3 {
                                         let s = src[c] * gv;
                                         let d = canvas[off + c] as f32;
                                         canvas[off + c] = (s + d * (1.0 - gv)).min(255.0) as u8;
                                     }
                                     let da = canvas[off + 3] as f32;
-                                    canvas[off + 3] = (255.0 * gv + da * (1.0 - gv)).min(255.0) as u8;
+                                    canvas[off + 3] =
+                                        (255.0 * gv + da * (1.0 - gv)).min(255.0) as u8;
                                 }
                             }
                         });
@@ -242,7 +252,9 @@ impl MenuPopup {
             }
         }
 
-        self.popup.wl_surface().damage_buffer(0, 0, self.width as i32, self.height as i32);
+        self.popup
+            .wl_surface()
+            .damage_buffer(0, 0, self.width as i32, self.height as i32);
         if let Err(err) = buffer.attach_to(self.popup.wl_surface()) {
             log::error!("menu popup attach failed: {err}");
             return;

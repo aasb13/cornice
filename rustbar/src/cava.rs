@@ -36,7 +36,7 @@ use std::thread;
 use calloop::channel::Sender;
 use rusttype::{Font, Scale, point};
 
-use crate::theme::{ACCENT, draw_border_only};
+use crate::theme::{accent, draw_border_only};
 
 /// Number of bars (waybar `cava` `bars: 14`).
 const BARS: usize = 14;
@@ -46,8 +46,7 @@ const ASCII_MAX: u8 = 7;
 /// waybar `cava` `format-icons`: the 8 Unicode block elements, lowest→highest.
 ///   ▁ U+2581 lower one eighth block … █ U+2588 full block.
 const FORMAT_ICONS: [char; 8] = [
-    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}',
-    '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
+    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}',
 ];
 /// waybar `#cava` CSS `padding: 0 8px`.
 const H_PAD: u32 = 8;
@@ -199,7 +198,7 @@ impl Cava {
         self.layout = (x_offset, x_offset + box_w);
 
         // waybar `#cava`: transparent background, 1px accent border (no fill).
-        draw_border_only(canvas, stride, x_offset, 0, box_w, height, ACCENT);
+        draw_border_only(canvas, stride, x_offset, 0, box_w, height, accent());
 
         // Pen: 1px in from the border, 8px h-padding, vertically centered. The
         // block glyphs sit at the bottom of their cell, so bars grow upward from
@@ -226,15 +225,14 @@ impl Cava {
                             // same as the clock/workspaces text so accent
                             // composites correctly over the transparent box.
                             let gv = v.powf(1.0 / 2.2);
-                            let src = [ACCENT.2 as f32, ACCENT.1 as f32, ACCENT.0 as f32]; // b,g,r
+                            let src = accent().bgr(); // b, g, r
                             for c in 0..3 {
                                 let s = src[c] * gv;
                                 let d = canvas[off + c] as f32;
                                 canvas[off + c] = (s + d * (1.0 - gv)).min(255.0) as u8;
                             }
                             let da = canvas[off + 3] as f32;
-                            canvas[off + 3] =
-                                (255.0 * gv + da * (1.0 - gv)).min(255.0) as u8;
+                            canvas[off + 3] = (255.0 * gv + da * (1.0 - gv)).min(255.0) as u8;
                         }
                     }
                 });
@@ -255,7 +253,9 @@ impl Cava {
     /// freezes cava on its last frame; SIGCONT resumes. Uses the `kill` util so
     /// we don't need a `libc`/`nix` dependency.
     pub fn toggle_pause(&mut self) {
-        let Some(child) = self.child.as_ref() else { return };
+        let Some(child) = self.child.as_ref() else {
+            return;
+        };
         let pid = child.id();
         self.paused = !self.paused;
         let sig = if self.paused { "STOP" } else { "CONT" };

@@ -2,7 +2,7 @@ use hyprland::data::{Workspace, Workspaces};
 use hyprland::shared::{HyprData, HyprDataActive, HyprDataVec};
 use rusttype::{Font, Scale, point};
 
-use crate::theme::{draw_bordered_box, fill_rect, ACCENT, BG, INACTIVE};
+use crate::theme::{accent, bg, draw_bordered_box, fill_rect, inactive, on_accent};
 
 const NUM_SLOTS: i32 = 10;
 /// Button width — waybar `#workspaces button { min-width: 22px }`.
@@ -22,7 +22,11 @@ pub struct WorkspaceList {
 
 impl WorkspaceList {
     pub fn new() -> Self {
-        Self { font: None, layout: Vec::new(), hovered: None }
+        Self {
+            font: None,
+            layout: Vec::new(),
+            hovered: None,
+        }
     }
 
     pub fn init(&mut self) {
@@ -62,7 +66,16 @@ impl WorkspaceList {
         // ── Container: opaque black background with a 1px accent border ──
         //    (waybar `#workspaces { background:#000; border:1px solid accent }`).
         let container_w = 2 * BORDER + NUM_SLOTS as u32 * BOX_WIDTH;
-        draw_bordered_box(canvas, stride, x_offset, 0, container_w, height, BG, ACCENT);
+        draw_bordered_box(
+            canvas,
+            stride,
+            x_offset,
+            0,
+            container_w,
+            height,
+            bg(),
+            accent(),
+        );
 
         let bar_width = stride / 4;
         let scale = Scale::uniform(height as f32 * 0.5);
@@ -81,20 +94,20 @@ impl WorkspaceList {
 
             // active → accent background (waybar `.active { background: accent }`)
             if is_active {
-                fill_rect(canvas, stride, bx, by, bw, bh, ACCENT, 255);
+                fill_rect(canvas, stride, bx, by, bw, bh, accent(), 255);
             }
 
             // Text color, matching waybar's button/empty/active/hover rules:
-            //   active            → black (on accent bg)
+            //   active            → `on_accent` (readable over the accent fill)
             //   exists, not active → accent
             //   empty + hover      → accent (`:hover { color: accent }`)
-            //   empty              → #222222 (`.empty { color: #222 }`)
-            let (r, g, b) = if is_active {
-                (0, 0, 0)
+            //   empty              → `inactive` (`.empty { color: #222 }`)
+            let text_color = if is_active {
+                on_accent()
             } else if existing.contains(&slot) || self.hovered == Some(slot) {
-                ACCENT
+                accent()
             } else {
-                INACTIVE
+                inactive()
             };
 
             let text = slot.to_string();
@@ -124,7 +137,7 @@ impl WorkspaceList {
                                 // either the black container bg or the accent
                                 // active-button fill.
                                 let gv = v.powf(1.0 / 2.2);
-                                let src = [b as f32, g as f32, r as f32]; // b, g, r
+                                let src = text_color.bgr(); // b, g, r
                                 for c in 0..3 {
                                     let s = src[c] * gv;
                                     let d = canvas[off + c] as f32;

@@ -1,4 +1,4 @@
-use crate::theme::{draw_bordered_box, ACCENT, BG};
+use crate::theme::{accent, bg, draw_bordered_box};
 use crate::tray::{MenuItem, TrayCommand, TrayIcons};
 
 pub struct TrayRenderer {
@@ -10,7 +10,11 @@ pub struct TrayRenderer {
 
 impl TrayRenderer {
     pub fn new(icons: TrayIcons, cmd_tx: tokio::sync::mpsc::UnboundedSender<TrayCommand>) -> Self {
-        Self { icons, cmd_tx, layout: Vec::new() }
+        Self {
+            icons,
+            cmd_tx,
+            layout: Vec::new(),
+        }
     }
 
     /// Renders the tray as a waybar `#tray` box (black bg, 1px accent border,
@@ -38,7 +42,7 @@ impl TrayRenderer {
         let box_w = 2 * border + 2 * h_pad + content_w;
         let box_x = right_edge.saturating_sub(box_w);
 
-        draw_bordered_box(canvas, stride, box_x, 0, box_w, height, BG, ACCENT);
+        draw_bordered_box(canvas, stride, box_x, 0, box_w, height, bg(), accent());
 
         // Icons left-to-right inside the box, each centered in its slot.
         let mut x = box_x + border + h_pad;

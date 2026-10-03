@@ -932,7 +932,7 @@ impl RotatingTesseract {
     ) {
         let px = cell_x as i32 + glyph.min_x;
         let py = (cell_y + baseline) as i32 + glyph.min_y;
-        Self::blit(glyph, canvas, width, height, stride, px, py, col);
+        RotatingTesseract::blit(glyph, canvas, width, height, stride, px, py, col);
     }
 
     /// Draw one rain wall. It is a solid, fully-filled column of symbols that
@@ -1013,7 +1013,7 @@ impl RotatingTesseract {
                         wf.x,
                         y,
                         baseline,
-                        Self::pack(color, bright * (1.0 - t)),
+                        RotatingTesseract::pack(color, bright * (1.0 - t)),
                     );
                 }
                 if let Some(g) = glyphs.get(wf.cells[i] as usize) {
@@ -1026,7 +1026,7 @@ impl RotatingTesseract {
                         wf.x,
                         y,
                         baseline,
-                        Self::pack(color, bright * t),
+                        RotatingTesseract::pack(color, bright * t),
                     );
                 }
             } else if let Some(g) = glyphs.get(wf.cells[i] as usize) {
@@ -1039,7 +1039,7 @@ impl RotatingTesseract {
                     wf.x,
                     y,
                     baseline,
-                    Self::pack(color, bright),
+                    RotatingTesseract::pack(color, bright),
                 );
             }
         }
@@ -1349,7 +1349,7 @@ impl FrameSource for RotatingTesseract {
                 ox + col as f32 * cell_w,
                 oy + row as f32 * cell_h,
                 ascent,
-                Self::pack(tess_color, bright),
+                RotatingTesseract::pack(tess_color, bright),
             );
         }
 
@@ -1360,6 +1360,60 @@ impl FrameSource for RotatingTesseract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end check that a configured colour lands in the right channel.
+    ///
+    /// `pack` produces a little-endian `Xrgb8888` word (B in the low byte, R two
+    /// bytes up) and `blit` then unpacks it through a single shared R/B multiply,
+    /// so the two are easy to get individually plausible and jointly wrong: swap
+    /// one and every colour comes out with red and blue exchanged. A green
+    /// default hides that completely (r≈b), which is exactly why it survived —
+    /// so this asserts on the bytes the compositor actually receives, for a
+    /// colour where the two channels are far apart.
+    #[test]
+    fn a_configured_colour_reaches_the_right_canvas_channels() {
+        let glyph = Glyph {
+            min_x: 0,
+            min_y: 0,
+            w: 1,
+            h: 1,
+            runs: vec![(0 << 16) | (0 << 8) | 1],
+            row_start: vec![0, 1],
+            data: vec![0xff],
+        };
+        // A pure-red glyph at full brightness: no red/blue ambiguity to hide.
+        // 254 rather than 255 because coverage is attenuated with a `>>8`
+        // (divide by 256, not 255) — see `blit`.
+        let col = RotatingTesseract::pack(Color::rgb(255, 0, 0), 1.0);
+        let mut canvas = [0u8; 4];
+        RotatingTesseract::blit(&glyph, &mut canvas, 1, 1, 4, 0, 0, col);
+        // The canvas contract is `B, G, R, X`.
+        assert_eq!(canvas, [0, 0, 254, 0xff]);
+
+        // And a blue one, so a swap can't pass by accident.
+        let col = RotatingTesseract::pack(Color::rgb(0, 0, 255), 1.0);
+        let mut canvas = [0u8; 4];
+        RotatingTesseract::blit(&glyph, &mut canvas, 1, 1, 4, 0, 0, col);
+        assert_eq!(canvas, [254, 0, 0, 0xff]);
+    }
+
+    /// `pack` is the canonical `Xrgb8888` word: B in the low byte, R two bytes
+    /// up, X unused. `blit` relies on this exact layout to attenuate R and B
+    /// with one multiply.
+    #[test]
+    fn pack_produces_xrgb8888() {
+        assert_eq!(
+            RotatingTesseract::pack(Color::rgb(0x11, 0x22, 0x33), 1.0),
+            0x00_33_22_11
+        );
+        assert_eq!(
+            RotatingTesseract::pack(Color::rgb(0x11, 0x22, 0x33), 0.5),
+            0x00_19_11_08
+        );
+        // A brightness that would make the glyph invisible packs to 0 so
+        // callers can skip the blit.
+        assert_eq!(RotatingTesseract::pack(Color::rgb(0x11, 0x22, 0x33), 0.0), 0);
+    }
 
     /// The tesseract's cell grid is kept between frames (so it doesn't have to
     /// be reallocated every frame), which means `render` has to wipe it. If it

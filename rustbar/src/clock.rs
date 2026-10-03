@@ -1,6 +1,6 @@
 use rusttype::{Font, Scale, point};
 
-use crate::theme::{draw_bordered_box, ACCENT, BG};
+use crate::theme::{accent, bg, draw_bordered_box};
 
 pub struct Clock {
     font: Option<Font<'static>>,
@@ -53,7 +53,7 @@ impl Clock {
         let box_x = left + usable_w.saturating_sub(box_w) / 2;
 
         // waybar `#clock` box: black bg + 1px accent border.
-        draw_bordered_box(canvas, stride, box_x, 0, box_w, height, BG, ACCENT);
+        draw_bordered_box(canvas, stride, box_x, 0, box_w, height, bg(), accent());
 
         // text: 14px in from the box's left border, vertically centered
         let x = box_x as f32 + BORDER as f32 + H_PAD as f32;
@@ -78,7 +78,7 @@ impl Clock {
                             // src-over so accent text composites correctly over
                             // the black box instead of poking holes in it.
                             let gv = v.powf(1.0 / 2.2);
-                            let src = [ACCENT.2 as f32, ACCENT.1 as f32, ACCENT.0 as f32]; // b, g, r
+                            let src = accent().bgr();
                             for c in 0..3 {
                                 let s = src[c] * gv;
                                 let d = canvas[off + c] as f32;

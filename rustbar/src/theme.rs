@@ -1,19 +1,65 @@
-//! Shared color palette, kept in sync with the waybar style
-//! (`~/.config/waybar/style.css`). The accent is the mint/teal green
-//! `rgb(191, 255, 217)` (`#BFFFD9`).
+//! Drawing primitives shared by every bar module.
+//!
+//! The palette itself is not here — it comes from `~/.config/rustbar/config.toml`
+//! (see [`crate::config`]) and is reached through the accessors below, so a
+//! colour change is a config edit rather than a recompile. The defaults still
+//! match the waybar style this bar was modelled on (`~/.config/waybar/style.css`).
 //!
 //! Canvas pixels are `wl_shm` argb8888 in native (little-endian) byte order,
-//! i.e. `B, G, R, A` in memory — so the draw sites write `ACCENT.2` into the
-//! blue byte, `ACCENT.1` into green, `ACCENT.0` into red.
+//! i.e. `B, G, R, A` in memory — the reverse of how channels read in a config
+//! file, so everything here converts via [`Color::to_bgra`] rather than
+//! unpacking a tuple by hand.
 
-/// Primary accent — text, borders, active states. (R, G, B) in 0..=255.
-pub const ACCENT: (u8, u8, u8) = (191, 255, 217);
+use std::sync::OnceLock;
 
-/// Bar / popup background (waybar `#000000`).
-pub const BG: (u8, u8, u8) = (0, 0, 0);
+use crate::config::{Color, Colors, Config};
 
-/// Hover background for menu rows (waybar `#1a1a1a`).
-pub const BG_HOVER: (u8, u8, u8) = (26, 26, 26);
+/// The loaded palette, read once at startup.
+static COLORS: OnceLock<Colors> = OnceLock::new();
+
+/// Install the loaded config. Called once from `main`; a second call is
+/// ignored, which keeps `OnceLock`'s "set once" contract intact without
+/// threading a handle through every module's constructor.
+pub fn init(config: &Config) {
+    let _ = COLORS.set(config.colors.clone());
+}
+
+/// The active palette.
+///
+/// # Panics
+/// If called before [`init`]. Every draw site is reached from
+/// `wayland_backend::run`, which `main` only calls after loading the config, so
+/// this cannot happen in practice.
+pub fn colors() -> &'static Colors {
+    COLORS
+        .get()
+        .expect("theme::init must run before any drawing")
+}
+
+/// Primary accent — text, borders, active states.
+pub fn accent() -> Color {
+    colors().accent
+}
+
+/// Bar / popup background.
+pub fn bg() -> Color {
+    colors().background
+}
+
+/// Hover background for menu rows.
+pub fn bg_hover() -> Color {
+    colors().background_hover
+}
+
+/// Text drawn on top of an accent-filled workspace button.
+pub fn on_accent() -> Color {
+    colors().on_accent
+}
+
+/// Empty / inactive workspace text.
+pub fn inactive() -> Color {
+    colors().inactive
+}
 
 /// Side margin — pixels of empty space left on the left and right edges of
 /// the bar (waybar `config.jsonc` `margin-left` / `margin-right: 20`). Modules
@@ -24,12 +70,9 @@ pub const SIDE_MARGIN: u32 = 20;
 /// and the top of the output.
 pub const TOP_MARGIN: i32 = 10;
 
-/// Empty / inactive workspace text (waybar `#222222`).
-pub const INACTIVE: (u8, u8, u8) = (34, 34, 34);
-
-/// Opaque rectangle fill in BGRA (argb8888 little-endian). Bounds-checked
-/// against the canvas; out-of-range coordinates are skipped. Shared by every
-/// module that draws a waybar-style outlined box (clock, workspaces, …).
+/// Opaque rectangle fill. Bounds-checked against the canvas; out-of-range
+/// coordinates are skipped. Shared by every module that draws a waybar-style
+/// outlined box (clock, workspaces, …).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_rect(
     canvas: &mut [u8],
@@ -38,17 +81,15 @@ pub(crate) fn fill_rect(
     y: u32,
     w: u32,
     h: u32,
-    (r, g, b): (u8, u8, u8),
+    color: Color,
     a: u8,
 ) {
+    let px = color.to_bgra(a);
     for yy in y..y.saturating_add(h) {
         for xx in x..x.saturating_add(w) {
             let off = (yy * stride + xx * 4) as usize;
             if off + 3 < canvas.len() {
-                canvas[off] = b;
-                canvas[off + 1] = g;
-                canvas[off + 2] = r;
-                canvas[off + 3] = a;
+                canvas[off..off + 4].copy_from_slice(&px);
             }
         }
     }
@@ -67,15 +108,33 @@ pub(crate) fn draw_border_only(
     y: u32,
     w: u32,
     h: u32,
-    border: (u8, u8, u8),
+    border: Color,
 ) {
     const B: u32 = 1;
     // top & bottom edges
     fill_rect(canvas, stride, x, y, w, B, border, 255);
-    fill_rect(canvas, stride, x, y + h.saturating_sub(B), w, B, border, 255);
+    fill_rect(
+        canvas,
+        stride,
+        x,
+        y + h.saturating_sub(B),
+        w,
+        B,
+        border,
+        255,
+    );
     // left & right edges
     fill_rect(canvas, stride, x, y, B, h, border, 255);
-    fill_rect(canvas, stride, x + w.saturating_sub(B), y, B, h, border, 255);
+    fill_rect(
+        canvas,
+        stride,
+        x + w.saturating_sub(B),
+        y,
+        B,
+        h,
+        border,
+        255,
+    );
 }
 
 /// A filled rectangle with a 1px border on all four edges — the waybar
@@ -89,15 +148,84 @@ pub(crate) fn draw_bordered_box(
     y: u32,
     w: u32,
     h: u32,
-    fill: (u8, u8, u8),
-    border: (u8, u8, u8),
+    fill: Color,
+    border: Color,
 ) {
     const B: u32 = 1;
     fill_rect(canvas, stride, x, y, w, h, fill, 255);
     // top & bottom edges
     fill_rect(canvas, stride, x, y, w, B, border, 255);
-    fill_rect(canvas, stride, x, y + h.saturating_sub(B), w, B, border, 255);
+    fill_rect(
+        canvas,
+        stride,
+        x,
+        y + h.saturating_sub(B),
+        w,
+        B,
+        border,
+        255,
+    );
     // left & right edges
     fill_rect(canvas, stride, x, y, B, h, border, 255);
-    fill_rect(canvas, stride, x + w.saturating_sub(B), y, B, h, border, 255);
+    fill_rect(
+        canvas,
+        stride,
+        x + w.saturating_sub(B),
+        y,
+        B,
+        h,
+        border,
+        255,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rect and box primitives are the only places colours become canvas
+    /// bytes, and they get the byte order backwards easily and silently.
+    #[test]
+    fn primitives_write_bgra() {
+        let mut canvas = [0u8; 4 * 4];
+        let color = Color::rgb(0x11, 0x22, 0x33);
+        fill_rect(&mut canvas, 4, 1, 1, 1, 1, color, 255);
+        // One 4x4 row of pixels; pixel (x=1, y=1) is bytes 8..12.
+        assert_eq!(&canvas[8..12], &[0x33, 0x22, 0x11, 0xff]);
+        assert!(
+            canvas
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b != 0 || !(8..12).contains(&i)),
+            "the fill leaked outside its single pixel: {canvas:?}"
+        );
+    }
+
+    /// Out-of-range writes are skipped rather than panicking; a colour change
+    /// that made a box bigger must not take the bar down with it.
+    #[test]
+    fn primitives_clip_instead_of_panicking() {
+        let mut canvas = [0u8; 4];
+        fill_rect(
+            &mut canvas,
+            4,
+            100,
+            100,
+            10,
+            10,
+            Color::rgb(255, 255, 255),
+            255,
+        );
+        draw_bordered_box(
+            &mut canvas,
+            4,
+            100,
+            100,
+            10,
+            10,
+            Color::rgb(255, 255, 255),
+            Color::rgb(255, 255, 255),
+        );
+        assert_eq!(canvas, [0; 4]);
+    }
 }
