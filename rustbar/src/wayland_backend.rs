@@ -243,7 +243,10 @@ pub fn run(
     let qh_for_hypr = qh.clone();
     loop_handle
         .insert_source(hypr_rx, move |event, _, app: &mut App| match event {
-            calloop::channel::Event::Msg(HyprEvent::WorkspaceChanged) => app.draw(&qh_for_hypr),
+            calloop::channel::Event::Msg(HyprEvent::Workspaces(state)) => {
+                app.workspaces.set_state(state);
+                app.draw(&qh_for_hypr);
+            }
             calloop::channel::Event::Msg(HyprEvent::LayoutChanged) => {
                 app.widgets.refresh_language();
                 app.draw(&qh_for_hypr);
@@ -283,12 +286,16 @@ pub fn run(
     // effect; the signal source is what makes `--reload` immediate, since the
     // loop is otherwise parked in `dispatch` and would only notice on the next
     // one-second tick at best.
-    if config.reload.watch {
+    //
+    // Inserted unconditionally: `[reload] watch` is honoured inside
+    // `check_reload`, per tick, so that turning it on in the config file can
+    // actually start watching. Gating the insertion on it instead would make
+    // `watch = true` a no-op for the rest of the process's life.
+    {
         let qh_for_reload = qh.clone();
-        let interval = config.reload.interval();
         loop_handle
             .insert_source(
-                Timer::from_duration(interval),
+                Timer::from_duration(config.reload.interval()),
                 move |_deadline, _, app: &mut App| {
                     // A colour change alone needs no redraw — every draw site
                     // reads the palette fresh — but redrawing costs nothing at
@@ -296,7 +303,7 @@ pub fn run(
                     // future option turns out to affect layout.
                     app.check_reload();
                     app.draw(&qh_for_reload);
-                    TimeoutAction::ToDuration(interval)
+                    TimeoutAction::ToDuration(app.reload.interval())
                 },
             )
             .map_err(|e| anyhow!("failed to insert reload timer: {e}"))?;
@@ -368,6 +375,26 @@ pub(crate) struct Reload {
     watch: bool,
 }
 
+impl Reload {
+    /// Adopt the reload settings from a freshly-loaded config.
+    ///
+    /// The timer that drives this is inserted unconditionally, so whether
+    /// watching happens at all is a per-tick decision rather than a property of
+    /// the event loop's source graph — otherwise turning `watch` on from the
+    /// config file could never take effect, since nothing would be left to
+    /// notice.
+    fn apply(&mut self, cfg: &crate::config::ReloadConfig) {
+        self.watch = cfg.watch;
+        self.watcher.set_interval(cfg.interval());
+    }
+
+    /// The poll interval currently in force. Read per tick rather than captured,
+    /// so editing `interval_ms` in the config takes effect without a restart.
+    fn interval(&self) -> std::time::Duration {
+        self.watcher.interval()
+    }
+}
+
 impl App {
     /// Re-read the config if the file changed on disk, and apply it.
     fn check_reload(&mut self) {
@@ -388,7 +415,7 @@ impl App {
         match Config::load(Some(&self.reload.path)) {
             Ok(config) => {
                 crate::theme::init(&config);
-                self.reload.watch = config.reload.watch;
+                self.reload.apply(&config.reload);
                 log::info!("config reloaded");
             }
             Err(e) => log::error!("config reload failed, keeping the previous config: {e:#}"),

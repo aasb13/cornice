@@ -51,11 +51,9 @@ impl Watcher {
         }
     }
 
-    /// Whether enough time has passed to check the file again.
-    ///
-    /// Optional: [`Watcher::changed`] gates itself, so a caller only needs this
-    /// to avoid the `stat` when it has other per-tick work to do first.
-    pub fn due(&self) -> bool {
+    /// Whether enough time has passed to check the file again. Private because
+    /// [`Watcher::changed`] gates itself — callers get that for free.
+    fn due(&self) -> bool {
         match self.next_poll {
             Some(t) => std::time::Instant::now() >= t,
             None => true,
@@ -87,6 +85,19 @@ impl Watcher {
             return true;
         }
         false
+    }
+
+    /// How often [`Watcher::changed`] is allowed to touch the filesystem.
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// Change the poll interval, so a config edit that adjusts it takes effect
+    /// without a restart. The gate is re-based on the new interval from now,
+    /// rather than keeping the delay the previous one had already accumulated.
+    pub fn set_interval(&mut self, interval: Duration) {
+        self.interval = interval;
+        self.next_poll = None;
     }
 
     /// Clear the interval gate so the next [`Watcher::changed`] call checks
@@ -283,6 +294,28 @@ mod tests {
         // the filesystem hands back an identical mtime.
         std::fs::write(&path, "a = 123456789").unwrap();
         assert!(w.changed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The poll interval is config, so editing it has to take effect without a
+    /// restart — and it has to take effect *now*, not after the delay the old
+    /// interval had already banked.
+    #[test]
+    fn setting_the_interval_rebases_the_gate_immediately() {
+        let dir = tmp("reinterval");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "a = 1").unwrap();
+        let mut w = Watcher::new(path.clone(), Duration::from_secs(3600));
+
+        w.changed();
+        assert!(!w.due(), "a long interval should be holding the gate");
+
+        w.set_interval(Duration::from_millis(0));
+        assert_eq!(w.interval(), Duration::from_millis(0));
+        assert!(w.due(), "the new interval must not wait out the old one");
+
+        std::fs::write(&path, "a = 2").unwrap();
+        assert!(w.changed(), "the shorter interval must actually poll");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

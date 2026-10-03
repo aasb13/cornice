@@ -1163,7 +1163,12 @@ impl FrameSource for RotatingTesseract {
                 self.offset_x = offset_x;
                 self.offset_y = offset_y;
                 self.ascent = v_metrics.ascent;
-                self.start_time = Instant::now();
+                // `last_frame` but *not* `start_time`: re-rasterizing took real
+                // time, and charging that to the next frame would make the rain
+                // jump. The rotation clock, though, is the animation itself and
+                // is owned by `new` — restarting it here would snap the
+                // tesseract back to phase 0 on every reload that invalidates the
+                // glyph caches (a font, size, ramp or rain-glyph change).
                 self.last_frame = Instant::now();
 
                 log::info!("Loaded font from: {}", path);
@@ -1468,11 +1473,18 @@ mod tests {
     /// frame after frame until the whole grid is being blitted — which is both
     /// the "cube became a sphere" bug and a growing pile of work per frame.
     ///
-    /// The check is phase-independent: measure the lit cells at some rotation,
-    /// spin for several seconds, then come back to the *same* rotation. A grid
-    /// that is wiped each frame lands on the same number of cells it started
-    /// with; a stale one is stuck at the union of every phase it ever drew
-    /// (~900 cells at 1080p, versus ~150-300 for a clean frame).
+    /// The check rests on rendering the *same* rotation twice and comparing.
+    /// That needs the phase pinned at the moment of each call: `render` derives
+    /// it from `start_time.elapsed()`, so a `start_time` shared across calls
+    /// makes "the same rotation" mean phase 0 and then phase however-long-the-
+    /// spin-took. A generic rotation lights more cells than the exactly
+    /// axis-aligned phase 0 (fewer edges land on top of each other), so that
+    /// drift alone reads as a stale grid.
+    ///
+    /// With the phase held, a grid that is wiped each frame lands on the same
+    /// number of cells it started with; a stale one is stuck at the union of
+    /// every phase it ever drew (~900 cells at 1080p, versus ~150-300 for a
+    /// clean frame).
     #[test]
     fn tesseract_cell_grid_is_reset_every_frame() {
         let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
@@ -1488,28 +1500,28 @@ mod tests {
         const H: u32 = 1080;
         let stride = W * 4;
         let mut canvas = vec![0u8; (stride * H) as usize];
-        let base = Instant::now();
         let lit = |s: &RotatingTesseract| s.grid.iter().filter(|c| c.is_some()).count();
 
-        let at_phase_zero = |s: &mut RotatingTesseract, canvas: &mut [u8]| {
-            s.start_time = base;
-            s.last_frame = base - Duration::from_secs_f64(1.0);
+        // `dt` is fixed at a full frame so the rain update is identical on every
+        // call; only the rotation phase varies.
+        let at_phase = |s: &mut RotatingTesseract, canvas: &mut [u8], phase: f64| {
+            let now = Instant::now();
+            s.start_time = now - Duration::from_secs_f64(phase);
+            s.last_frame = now - Duration::from_secs_f64(1.0);
             s.render(canvas, W, H, stride);
         };
 
-        at_phase_zero(&mut s, &mut canvas);
+        at_phase(&mut s, &mut canvas, 0.0);
         let first = lit(&s);
         assert!(first > 0, "tesseract drew nothing at all");
 
         // Five seconds of rotation, so the shape sweeps a wide arc of the grid.
         for f in 1..300u32 {
-            s.start_time = base - Duration::from_secs_f64(f64::from(f) / 60.0);
-            s.last_frame = base - Duration::from_secs_f64(1.0);
-            s.render(&mut canvas, W, H, stride);
+            at_phase(&mut s, &mut canvas, f64::from(f) / 60.0);
         }
 
         // Back where we started.
-        at_phase_zero(&mut s, &mut canvas);
+        at_phase(&mut s, &mut canvas, 0.0);
         let again = lit(&s);
         assert!(
             again <= first * 3 / 2 + 16,
@@ -1580,6 +1592,37 @@ mod tests {
         );
         assert_eq!(s.start_time, phase_before, "the rotation must not jump");
         assert_ne!(walls_before, 7);
+    }
+
+    /// The same promise on the *expensive* path. A colour-only reload swaps
+    /// values the draw loop reads every frame and never rebuilds anything, so
+    /// the test above cannot catch a rebuild restarting the clock — and a
+    /// rebuild is exactly where a font/size/ramp/rain-glyph edit lands, which is
+    /// what a user editing those keys actually does.
+    #[test]
+    fn a_rebuild_reload_keeps_the_rotation_clock_running() {
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
+        s.init(1920, 1080);
+        if s.font.is_none() {
+            // No system font in this environment; nothing to rasterize.
+            return;
+        }
+        let phase_before = s.start_time;
+        let cols_before = s.grid_cols;
+
+        // `font_size` is part of `rasterization_key`, so this re-runs `init`.
+        let mut resized = Config::default();
+        resized.cube3d.font_size = 12.0;
+        s.reconfigure(&resized, 1920, 1080);
+
+        assert_eq!(s.cfg.font_size, 12.0);
+        assert!(
+            s.grid_cols > cols_before,
+            "the glyph caches were not rebuilt ({cols_before} -> {} columns), so this \
+             never reached the path it exists to cover",
+            s.grid_cols
+        );
+        assert_eq!(s.start_time, phase_before, "the rotation must not jump");
     }
 
     /// Turning the rain off must clear the walls, not merely stop drawing them —

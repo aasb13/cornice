@@ -132,6 +132,19 @@ pub struct PowerSaveConfig {
     pub rain_divisor: u32,
 }
 
+impl PowerSaveConfig {
+    /// Whether the battery should be throttling the wallpaper, given whether a
+    /// battery is currently discharging.
+    ///
+    /// `enabled` is the master switch and is deliberately part of this
+    /// calculation rather than checked by the caller: turning it off has to be
+    /// able to *stop* power saving on a machine that is still unplugged, so the
+    /// switch cannot be treated as "only affects future transitions".
+    pub fn effective_on_battery(&self, discharging: bool) -> bool {
+        self.enabled && discharging
+    }
+}
+
 fn default_true() -> bool {
     true
 }

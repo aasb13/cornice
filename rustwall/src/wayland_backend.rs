@@ -48,6 +48,20 @@ pub struct Reload {
     watch: bool,
 }
 
+impl Reload {
+    /// Adopt the reload settings from a freshly-loaded config.
+    ///
+    /// Both settings live here rather than being read once at startup: `watch`
+    /// is checked per tick, and the interval has to be pushed into the watcher
+    /// because it gates polling. A new interval is installed even when the
+    /// watcher is switched off, so turning `watch` back on polls at the rate
+    /// the config asks for rather than whatever was set at launch.
+    fn apply(&mut self, cfg: &crate::config::ReloadConfig) {
+        self.watch = cfg.watch;
+        self.watcher.set_interval(cfg.interval());
+    }
+}
+
 /// Claim `monitor` (or, if `None`, the last output the compositor reports —
 /// matching the original vecpaper's fallback behavior) and start rendering
 /// `source` into a `wlr-layer-shell` background surface on it. Blocks
@@ -253,8 +267,10 @@ struct App {
     power: PowerMonitor,
     /// What to do while on battery, from the config.
     power_save: PowerSaveConfig,
-    /// The state the source was last told about, so we only wake it on a
-    /// change.
+    /// What the source currently believes about the power state — not the
+    /// machine's actual battery state, which is re-read from `power` every
+    /// time it matters. Keeping the two apart is what lets a config edit change
+    /// the answer without the battery itself having changed.
     on_battery: bool,
     /// Live config reloading: file watcher plus the manual `SIGHUP` path.
     reload: Reload,
@@ -265,6 +281,16 @@ struct App {
     buffer: Option<Buffer>,
     buf_w: u32,
     buf_h: u32,
+}
+
+/// The power state to push to the source, or `None` if it already has it.
+///
+/// Split out from [`App::check_power`] so the transition table is testable
+/// without a Wayland connection. `last` is what the source currently believes,
+/// so the caller never has to clear it to force a notification.
+fn next_power_state(last: bool, power_save: &PowerSaveConfig, discharging: bool) -> Option<bool> {
+    let now = power_save.effective_on_battery(discharging);
+    (now != last).then_some(now)
 }
 
 impl App {
@@ -293,11 +319,14 @@ impl App {
         match Config::load(Some(&self.reload.path)) {
             Ok(config) => {
                 self.power_save = config.power_save.clone();
-                // The battery state may have changed meaning: `enabled` could
+                // The battery state may have changed *meaning*: `enabled` could
                 // have been turned off, or the new cap applied while unplugged.
-                self.on_battery = false;
+                // `check_power` recomputes from the new config and notifies the
+                // source if the effective answer moved. The new cap itself
+                // reaches the source through `reconfigure`, not through here —
+                // `set_power_saving` only carries the on/off half.
                 self.check_power();
-                self.reload.watch = config.reload.watch;
+                self.reload.apply(&config.reload);
                 self.source.reconfigure(&config, self.width, self.height);
                 info!("config reloaded");
             }
@@ -309,20 +338,20 @@ impl App {
     /// Unplugging costs a throttled wallpaper; plugging back in must always
     /// restore full speed. Called once per frame, and it costs one atomic load.
     fn check_power(&mut self) {
-        let on_battery = self.power_save.enabled && self.power.poll();
-        if on_battery == self.on_battery {
+        let Some(now) = next_power_state(self.on_battery, &self.power_save, self.power.poll())
+        else {
             return;
-        }
-        self.on_battery = on_battery;
+        };
+        self.on_battery = now;
         log::info!(
             "power source changed: {}",
-            if on_battery {
+            if now {
                 "on battery, throttling"
             } else {
                 "on mains, full speed"
             }
         );
-        self.source.set_power_saving(on_battery);
+        self.source.set_power_saving(now);
     }
 
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
@@ -464,10 +493,12 @@ impl LayerShellHandler for App {
             self.configured = true;
             self.source.init(self.width, self.height);
             // The first battery reading happens before the first frame, so a
-            // wallpaper that boots on battery starts throttled.
-            self.on_battery = self.power_save.enabled && self.power.poll();
-            self.source.set_power_saving(self.on_battery);
-            if self.on_battery {
+            // wallpaper that boots on battery starts throttled. There is no
+            // prior belief to compare against, so the source is told either way.
+            let on_battery = self.power_save.effective_on_battery(self.power.poll());
+            self.on_battery = on_battery;
+            self.source.set_power_saving(on_battery);
+            if on_battery {
                 log::info!("running on battery: starting throttled");
             }
             self.interval = self.source.tick_interval();
@@ -494,3 +525,53 @@ delegate_output!(App);
 delegate_shm!(App);
 delegate_layer!(App);
 delegate_registry!(App);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn power_save(enabled: bool) -> PowerSaveConfig {
+        PowerSaveConfig {
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    /// The source only hears about the power state when the answer actually
+    /// changes, so this table is the whole notification contract. Each row is
+    /// (what the source believes, `enabled`, is a battery discharging, and
+    /// whether the source must be told).
+    ///
+    /// The fourth row is the bug this exists to pin down: the wallpaper is
+    /// running throttled, the battery has not changed, and the user turns
+    /// `power_save.enabled` off. Nothing about the *battery* moved, so a
+    /// notification keyed only on battery transitions never fires and the
+    /// wallpaper stays throttled forever. An earlier version forced this by
+    /// clearing the remembered state before re-checking, which collided with a
+    /// genuine `false` and instead skipped the notification for this row.
+    #[test]
+    fn the_source_is_told_exactly_when_the_effective_state_moves() {
+        let cases: &[(bool, bool, bool, Option<bool>)] = &[
+            // Idle on mains: nothing to say, ever.
+            (false, true, false, None),
+            // Unplugged from a full-speed start: throttle.
+            (false, true, true, Some(true)),
+            // Plugged back in: always restore full speed.
+            (true, true, false, Some(false)),
+            // Disabled while unplugged: the battery is unchanged, but the answer
+            // is not — the source must be told to stop throttling.
+            (true, false, true, Some(false)),
+            // Disabled and on mains: already at full speed.
+            (false, false, true, None),
+            // Still throttled on battery: no change.
+            (true, true, true, None),
+        ];
+        for &(last, enabled, discharging, expected) in cases {
+            let got = next_power_state(last, &power_save(enabled), discharging);
+            assert_eq!(
+                got, expected,
+                "last={last} enabled={enabled} discharging={discharging}"
+            );
+        }
+    }
+}

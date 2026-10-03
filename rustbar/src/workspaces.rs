@@ -1,5 +1,3 @@
-use hyprland::data::{Workspace, Workspaces};
-use hyprland::shared::{HyprData, HyprDataActive, HyprDataVec};
 use rusttype::{Font, Scale, point};
 
 use crate::theme::{accent, bg, draw_bordered_box, fill_rect, inactive, on_accent};
@@ -11,6 +9,29 @@ const BOX_WIDTH: u32 = 22;
 /// (waybar `#workspaces { border: 1px solid accent }`).
 const BORDER: u32 = 1;
 
+/// Which workspace is active, and which ones exist.
+///
+/// A snapshot rather than a live query: reading it from Hyprland is a blocking
+/// socket round-trip (see [`crate::hypr`]), and painting happens on every frame
+/// — including the ~120/second frames the audio visualiser drives. [`Self`]
+/// holds the latest one so `render` costs no IPC at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceState {
+    /// The active workspace's id, or -1 when Hyprland hasn't said.
+    pub active: i32,
+    /// The ids of every workspace that currently exists.
+    pub existing: Vec<i32>,
+}
+
+impl Default for WorkspaceState {
+    fn default() -> Self {
+        WorkspaceState {
+            active: -1,
+            existing: Vec::new(),
+        }
+    }
+}
+
 pub struct WorkspaceList {
     font: Option<Font<'static>>,
     /// (workspace id, x_start, x_end) for the boxes drawn in the last render —
@@ -18,6 +39,8 @@ pub struct WorkspaceList {
     layout: Vec<(i32, u32, u32)>,
     /// Currently hovered slot (1..=NUM_SLOTS), for the `:hover` text color.
     hovered: Option<i32>,
+    /// Latest snapshot from the Hyprland event thread.
+    state: WorkspaceState,
 }
 
 impl WorkspaceList {
@@ -26,7 +49,13 @@ impl WorkspaceList {
             font: None,
             layout: Vec::new(),
             hovered: None,
+            state: WorkspaceState::default(),
         }
+    }
+
+    /// Adopt a snapshot from the Hyprland event thread.
+    pub fn set_state(&mut self, state: WorkspaceState) {
+        self.state = state;
     }
 
     pub fn init(&mut self) {
@@ -58,10 +87,7 @@ impl WorkspaceList {
             None => return,
         };
 
-        let active_id = Workspace::get_active().map(|w| w.id).unwrap_or(-1);
-        let existing: Vec<i32> = Workspaces::get()
-            .map(|ws| ws.to_vec().iter().map(|w| w.id).collect())
-            .unwrap_or_default();
+        let active_id = self.state.active;
 
         // ── Container: opaque black background with a 1px accent border ──
         //    (waybar `#workspaces { background:#000; border:1px solid accent }`).
@@ -104,7 +130,7 @@ impl WorkspaceList {
             //   empty              → `inactive` (`.empty { color: #222 }`)
             let text_color = if is_active {
                 on_accent()
-            } else if existing.contains(&slot) || self.hovered == Some(slot) {
+            } else if self.state.existing.contains(&slot) || self.hovered == Some(slot) {
                 accent()
             } else {
                 inactive()
@@ -186,8 +212,9 @@ impl WorkspaceList {
     /// sends the pre-Lua-config dispatch string format, which current
     /// Hyprland's Lua-wrapped command parser rejects. `hyprctl` is kept in
     /// lockstep with Hyprland itself, so it's the more reliable path for
-    /// dispatch specifically (reads/`Workspace::get_active`/etc via the
-    /// crate are unaffected and still fine).
+    /// dispatch specifically — the crate's *reads* are unaffected, which is why
+    /// the workspace snapshot still comes from it (on the Hyprland event thread,
+    /// where a blocking round-trip is free; see [`crate::hypr`]).
     pub fn switch_to(&self, id: i32) {
         let expr = format!("hl.dsp.focus({{ workspace = \"{id}\" }})");
         let result = std::process::Command::new("hyprctl")
