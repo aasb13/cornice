@@ -1,6 +1,8 @@
-use rusttype::{Font, Scale, point};
+use rusttype::Scale;
 
-use crate::theme::{accent, bg, draw_bordered_box, fill_rect, inactive, on_accent};
+use crate::theme::{
+    self, accent, bg, draw_bordered_box, draw_text, fill_rect, inactive, on_accent, text_width,
+};
 
 const NUM_SLOTS: i32 = 10;
 /// Button width — waybar `#workspaces button { min-width: 22px }`.
@@ -33,7 +35,6 @@ impl Default for WorkspaceState {
 }
 
 pub struct WorkspaceList {
-    font: Option<Font<'static>>,
     /// (workspace id, x_start, x_end) for the boxes drawn in the last render —
     /// used for hit-testing pointer clicks/hover.
     layout: Vec<(i32, u32, u32)>,
@@ -46,7 +47,6 @@ pub struct WorkspaceList {
 impl WorkspaceList {
     pub fn new() -> Self {
         Self {
-            font: None,
             layout: Vec::new(),
             hovered: None,
             state: WorkspaceState::default(),
@@ -58,33 +58,21 @@ impl WorkspaceList {
         self.state = state;
     }
 
-    pub fn init(&mut self) {
-        let paths = [
-            "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/TTF/TerminusTTF.ttf",
-        ];
-        for path in &paths {
-            if let Ok(data) = std::fs::read(path) {
-                if let Some(font) = Font::try_from_vec(data) {
-                    self.font = Some(font);
-                    return;
-                }
-            }
-        }
-        log::error!("no font found for workspaces");
-    }
-
     /// Total pixel width this module occupies on the left of the bar.
     pub fn width(&self) -> u32 {
         2 * BORDER + NUM_SLOTS as u32 * BOX_WIDTH
     }
 
+    /// How many buttons the last render laid out — one per slot, unless there was
+    /// no font to draw the numbers with.
+    pub fn button_count(&self) -> usize {
+        self.layout.len()
+    }
+
     pub fn render(&mut self, canvas: &mut [u8], x_offset: u32, height: u32, stride: u32) {
         self.layout.clear();
-        let font = match &self.font {
-            Some(f) => f,
-            None => return,
+        let Some(font) = theme::font() else {
+            return;
         };
 
         let active_id = self.state.active;
@@ -137,46 +125,19 @@ impl WorkspaceList {
             };
 
             let text = slot.to_string();
-            let total_width: f32 = text
-                .chars()
-                .map(|c| font.glyph(c).scaled(scale).h_metrics().advance_width)
-                .sum();
-            let x = bx as f32 + (bw as f32 - total_width) / 2.0;
+            let x = bx as f32 + (bw as f32 - text_width(font, scale, &text)) / 2.0;
             let y = by as f32 + (bh as f32 - glyph_height) / 2.0 + v_metrics.ascent;
-            let mut pen = point(x, y);
-
-            for c in text.chars() {
-                let glyph = font.glyph(c);
-                let scaled_glyph = glyph.scaled(scale);
-                let advance_width = scaled_glyph.h_metrics().advance_width;
-                let positioned_glyph = scaled_glyph.positioned(pen);
-
-                if let Some(bb) = positioned_glyph.pixel_bounding_box() {
-                    positioned_glyph.draw(|x_rel, y_rel, v| {
-                        let xi = bb.min.x + x_rel as i32;
-                        let yi = bb.min.y + y_rel as i32;
-                        if xi >= 0 && yi >= 0 && (xi as u32) < bar_width && (yi as u32) < height {
-                            let off = yi as usize * stride as usize + xi as usize * 4;
-                            if off + 3 < canvas.len() {
-                                // gamma-correct coverage, then premultiplied
-                                // src-over so text composites correctly over
-                                // either the black container bg or the accent
-                                // active-button fill.
-                                let gv = v.powf(1.0 / 2.2);
-                                let src = text_color.bgr(); // b, g, r
-                                for c in 0..3 {
-                                    let s = src[c] * gv;
-                                    let d = canvas[off + c] as f32;
-                                    canvas[off + c] = (s + d * (1.0 - gv)).min(255.0) as u8;
-                                }
-                                let da = canvas[off + 3] as f32;
-                                canvas[off + 3] = (255.0 * gv + da * (1.0 - gv)).min(255.0) as u8;
-                            }
-                        }
-                    });
-                }
-                pen.x += advance_width;
-            }
+            draw_text(
+                font,
+                scale,
+                canvas,
+                stride,
+                (bar_width, height),
+                &text,
+                x,
+                y,
+                text_color,
+            );
         }
     }
 

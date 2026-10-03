@@ -96,7 +96,7 @@ fn run_sync(cmd: &str, args: &[&str]) {
 pub fn run(
     monitor: Option<String>,
     bar_height: u32,
-    mut clock: Box<Clock>,
+    clock: Box<Clock>,
     reload: Reload<Config>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
@@ -129,25 +129,10 @@ pub fn run(
         pointer: None,
         themed_pointer: None,
         seat: None,
-        clock: {
-            clock.init();
-            clock
-        },
-        workspaces: {
-            let mut w = WorkspaceList::new();
-            w.init();
-            Box::new(w)
-        },
-        widgets: {
-            let mut w = WidgetStrip::new();
-            w.init();
-            Box::new(w)
-        },
-        cava: {
-            let mut c = Cava::new();
-            c.init();
-            Box::new(c)
-        },
+        clock,
+        workspaces: Box::new(WorkspaceList::new()),
+        widgets: Box::new(WidgetStrip::new()),
+        cava: Box::new(Cava::new()),
         tray: None,
         menu: None,
         scroll_accum: 0.0,

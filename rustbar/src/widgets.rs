@@ -11,9 +11,9 @@ use std::fs;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use rusttype::{Font, Scale, point};
+use rusttype::Scale;
 
-use crate::theme::{accent, bg, draw_bordered_box};
+use crate::theme::{self, accent, bg, draw_bordered_box, draw_text, text_width};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 const BORDER: u32 = 1;
@@ -104,7 +104,6 @@ pub enum SegKind {
 }
 
 pub struct WidgetStrip {
-    font: Option<Font<'static>>,
     /// Cached (kind, label) per segment, rebuilt at most once per
     /// `REFRESH_INTERVAL`. The kind drives click/scroll dispatch.
     cache: Vec<(SegKind, String)>,
@@ -122,7 +121,6 @@ pub struct WidgetStrip {
 impl WidgetStrip {
     pub fn new() -> Self {
         Self {
-            font: None,
             cache: Vec::new(),
             layout: Vec::new(),
             last_refresh: None,
@@ -132,39 +130,12 @@ impl WidgetStrip {
         }
     }
 
-    pub fn init(&mut self) {
-        let paths = [
-            // Nerd Font — the *non-Mono* variant that waybar's CSS calls
-            // "JetBrainsMono Nerd Font". The Mono variant shrinks every icon
-            // to fit a single monospace cell, so icons render smaller than the
-            // digits next to them; the regular variant draws icons at full
-            // size matching the text (verified: same advance width, bigger
-            // glyph ink), so icons match the font size without widening the bar.
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMNerdFontMono-Regular.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/TTF/TerminusTTF.ttf",
-        ];
-        for path in &paths {
-            if let Ok(data) = std::fs::read(path) {
-                if let Some(font) = Font::try_from_vec(data) {
-                    self.font = Some(font);
-                    return;
-                }
-            }
-        }
-        log::error!("no font found for widgets");
-    }
-
     /// Renders the seamless strip right-aligned to `right_edge`. Returns the
     /// total width consumed (0 if there's nothing to show).
     pub fn render(&mut self, canvas: &mut [u8], right_edge: u32, height: u32, stride: u32) -> u32 {
         self.maybe_refresh();
-        let font = match &self.font {
-            Some(f) => f,
-            None => return 0,
+        let Some(font) = theme::font() else {
+            return 0;
         };
         if self.cache.is_empty() {
             return 0;
@@ -180,10 +151,7 @@ impl WidgetStrip {
             .cache
             .iter()
             .map(|(kind, label)| {
-                let w: f32 = label
-                    .chars()
-                    .map(|c| font.glyph(c).scaled(scale).h_metrics().advance_width)
-                    .sum();
+                let w = text_width(font, scale, label);
                 (*kind, label.clone(), 2 * H_PAD + w.ceil() as u32)
             })
             .collect();
@@ -206,7 +174,15 @@ impl WidgetStrip {
             // text_w + 2*H_PAD, so pen_x = seg_x + H_PAD leaves equal padding.
             let pen_x = x as f32 + H_PAD as f32;
             draw_text(
-                font, scale, canvas, stride, bar_width, height, label, pen_x, y,
+                font,
+                scale,
+                canvas,
+                stride,
+                (bar_width, height),
+                label,
+                pen_x,
+                y,
+                accent(),
             );
             self.layout.push((*kind, x, x + w));
             x += w;
@@ -390,49 +366,6 @@ fn brightness_icon(pct: u8) -> char {
     let divisor = (100 / size).max(1);
     let idx = ((pct as usize) / divisor).min(size - 1);
     BRIGHTNESS_ICONS[idx]
-}
-
-// ── text draw: gamma-corrected, premultiplied src-over accent over the box ─
-#[allow(clippy::too_many_arguments)]
-fn draw_text(
-    font: &Font<'static>,
-    scale: Scale,
-    canvas: &mut [u8],
-    stride: u32,
-    bar_width: u32,
-    height: u32,
-    text: &str,
-    pen_x: f32,
-    pen_y: f32,
-) {
-    let mut pen = point(pen_x, pen_y);
-    for c in text.chars() {
-        let glyph = font.glyph(c);
-        let sg = glyph.scaled(scale);
-        let adv = sg.h_metrics().advance_width;
-        let pg = sg.positioned(pen);
-        if let Some(bb) = pg.pixel_bounding_box() {
-            pg.draw(|xr, yr, v| {
-                let xi = bb.min.x + xr as i32;
-                let yi = bb.min.y + yr as i32;
-                if xi >= 0 && (xi as u32) < bar_width && yi >= 0 && (yi as u32) < height {
-                    let off = yi as usize * stride as usize + xi as usize * 4;
-                    if off + 3 < canvas.len() {
-                        let gv = v.powf(1.0 / 2.2);
-                        let src = accent().bgr();
-                        for c in 0..3 {
-                            let s = src[c] * gv;
-                            let d = canvas[off + c] as f32;
-                            canvas[off + c] = (s + d * (1.0 - gv)).min(255.0) as u8;
-                        }
-                        let da = canvas[off + 3] as f32;
-                        canvas[off + 3] = (255.0 * gv + da * (1.0 - gv)).min(255.0) as u8;
-                    }
-                }
-            });
-        }
-        pen.x += adv;
-    }
 }
 
 // ── system readers — each returns None to gracefully skip its segment ──

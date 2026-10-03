@@ -7,7 +7,7 @@
 //! surface only receives pointer events while the pointer is over it, so it
 //! can't do click-outside-to-close on other windows.
 
-use rusttype::{Font, Scale, point};
+use rusttype::Scale;
 use smithay_client_toolkit::{
     compositor::{CompositorState, Surface},
     shell::{
@@ -22,7 +22,7 @@ use wayland_client::{
 };
 use wayland_protocols::xdg::shell::client::xdg_positioner::{Anchor, Gravity};
 
-use crate::theme::{accent, bg, bg_hover};
+use crate::theme::{self, accent, bg, bg_hover, draw_text, text_width};
 use crate::tray::MenuItem;
 use crate::wayland_backend::App;
 
@@ -34,21 +34,11 @@ const H_PAD: u32 = 16;
 /// Used only when no font could be loaded (so text can't be measured).
 const FALLBACK_MENU_WIDTH: u32 = 180;
 
-/// Total horizontal advance of `text` rendered at `scale`.
-fn label_width(font: &Font<'static>, scale: Scale, text: &str) -> f32 {
-    let mut w = 0.0;
-    for c in text.chars() {
-        w += font.glyph(c).scaled(scale).h_metrics().advance_width;
-    }
-    w
-}
-
 pub struct MenuPopup {
     popup: Popup,
     pool: SlotPool,
     width: u32,
     height: u32,
-    font: Option<Font<'static>>,
     /// which tray icon this menu belongs to, so clicks route back correctly
     pub owner_id: String,
     pub menu_path: String,
@@ -84,27 +74,15 @@ impl MenuPopup {
     ) -> anyhow::Result<Self> {
         let height = (items.len() as u32 * ROW_HEIGHT).max(ROW_HEIGHT);
 
-        // Load a font first so the menu can be sized to its labels.
-        let mut font = None;
-        for path in [
-            "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/TTF/TerminusTTF.ttf",
-        ] {
-            if let Ok(data) = std::fs::read(path) {
-                if let Some(f) = Font::try_from_vec(data) {
-                    font = Some(f);
-                    break;
-                }
-            }
-        }
-
-        let width = match font.as_ref() {
+        // The popup is sized to its labels up front, because the SHM buffer is
+        // allocated once and xdg_popup has to be told the size before the first
+        // commit.
+        let width = match theme::font() {
             Some(font) => {
                 let scale = Scale::uniform(FONT_SIZE);
                 let longest = items
                     .iter()
-                    .map(|item| label_width(font, scale, &item.label))
+                    .map(|item| text_width(font, scale, &item.label))
                     .max_by(|a, b| a.total_cmp(b))
                     .unwrap_or(0.0);
                 (longest.ceil() as u32).saturating_add(2 * H_PAD)
@@ -143,7 +121,6 @@ impl MenuPopup {
             pool,
             width,
             height,
-            font,
             owner_id,
             menu_path,
             items,
@@ -192,7 +169,7 @@ impl MenuPopup {
                 return;
             }
         };
-        let stride = self.width as i32 * 4;
+        let stride = self.width * 4;
 
         for (row, item) in self.items.iter().enumerate() {
             let y0 = row as u32 * ROW_HEIGHT;
@@ -204,51 +181,31 @@ impl MenuPopup {
             .to_bgra(255);
             for y in y0..y0 + ROW_HEIGHT {
                 for x in 0..self.width {
-                    let off = (y * stride as u32 + x * 4) as usize;
+                    let off = (y * stride + x * 4) as usize;
                     if off + 3 < canvas.len() {
                         canvas[off..off + 4].copy_from_slice(&row_bg);
                     }
                 }
             }
 
-            if let Some(font) = &self.font {
+            if let Some(font) = theme::font() {
                 let scale = Scale::uniform(FONT_SIZE);
                 let v_metrics = font.v_metrics(scale);
                 let pen_y =
                     y0 as f32 + (ROW_HEIGHT as f32 + v_metrics.ascent + v_metrics.descent) / 2.0;
-                let text_width = label_width(font, scale, &item.label);
-                let mut pen = point((self.width as f32 - text_width) / 2.0, pen_y);
-                for c in item.label.chars() {
-                    let glyph = font.glyph(c).scaled(scale);
-                    let advance = glyph.h_metrics().advance_width;
-                    let positioned = glyph.positioned(pen);
-                    if let Some(bb) = positioned.pixel_bounding_box() {
-                        positioned.draw(|xr, yr, v| {
-                            let xi = bb.min.x + xr as i32;
-                            let yi = bb.min.y + yr as i32;
-                            if xi >= 0
-                                && yi >= 0
-                                && (xi as u32) < self.width
-                                && (yi as u32) < self.height
-                            {
-                                let off = (yi as u32 * stride as u32 + xi as u32 * 4) as usize;
-                                if off + 3 < canvas.len() {
-                                    let gv = v.powf(1.0 / 2.2);
-                                    let src = accent().bgr();
-                                    for c in 0..3 {
-                                        let s = src[c] * gv;
-                                        let d = canvas[off + c] as f32;
-                                        canvas[off + c] = (s + d * (1.0 - gv)).min(255.0) as u8;
-                                    }
-                                    let da = canvas[off + 3] as f32;
-                                    canvas[off + 3] =
-                                        (255.0 * gv + da * (1.0 - gv)).min(255.0) as u8;
-                                }
-                            }
-                        });
-                    }
-                    pen.x += advance;
-                }
+                let pen_x = (self.width as f32 - text_width(font, scale, &item.label)) / 2.0;
+                // Bounds are the popup's own surface, not the bar's.
+                draw_text(
+                    font,
+                    scale,
+                    canvas,
+                    stride,
+                    (self.width, self.height),
+                    &item.label,
+                    pen_x,
+                    pen_y,
+                    accent(),
+                );
             }
         }
 

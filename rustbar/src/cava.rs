@@ -35,9 +35,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use calloop::channel::Sender;
-use rusttype::{Font, Scale, point};
+use rusttype::Scale;
 
-use crate::theme::{accent, bg, draw_bordered_box};
+use crate::theme::{self, accent, bg, draw_bordered_box, draw_text, text_width};
 
 /// Number of bars (waybar `cava` `bars: 14`).
 const BARS: usize = 14;
@@ -85,7 +85,6 @@ frame_delimiter = 10\n\
 noise_reduction = 77\n";
 
 pub struct Cava {
-    font: Option<Font<'static>>,
     /// Latest frame (BARS values, 0..=ASCII_MAX), shared with the reader thread.
     bars: Arc<Mutex<Vec<u8>>>,
     /// cava subprocess — killed on drop so the reader thread's stdout EOFs and
@@ -103,32 +102,12 @@ pub struct Cava {
 impl Cava {
     pub fn new() -> Self {
         Self {
-            font: None,
             bars: Arc::new(Mutex::new(vec![0u8; BARS])),
             child: None,
             config_path: PathBuf::new(),
             layout: (0, 0),
             paused: false,
         }
-    }
-
-    /// Load the glyph font. Same fallback chain as the clock/workspaces modules
-    /// — all three fonts cover the U+2581..=U+2588 block glyphs.
-    pub fn init(&mut self) {
-        let paths = [
-            "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-            "/usr/share/fonts/TTF/TerminusTTF.ttf",
-        ];
-        for path in &paths {
-            if let Ok(data) = std::fs::read(path) {
-                if let Some(font) = Font::try_from_vec(data) {
-                    self.font = Some(font);
-                    return;
-                }
-            }
-        }
-        log::error!("cava: no font found");
     }
 
     /// Spawn the cava subprocess and the stdout reader thread. Each parsed frame
@@ -173,9 +152,8 @@ impl Cava {
     /// Render the `#cava` box (background fill + 1px accent border, 8px
     /// h-padding) containing the latest frame's block glyphs, accent-colored.
     pub fn render(&mut self, canvas: &mut [u8], x_offset: u32, height: u32, stride: u32) {
-        let font = match &self.font {
-            Some(f) => f,
-            None => return,
+        let Some(font) = theme::font() else {
+            return;
         };
         let scale = Scale::uniform(height as f32 * FONT_SCALE);
         let v_metrics = font.v_metrics(scale);
@@ -184,18 +162,13 @@ impl Cava {
         // Map each bar value to its format-icons glyph (waybar does exactly
         // this: `getIcon(value, "", ascii_range + 1)`).
         let frame = self.bars.lock().unwrap().clone();
-        let glyphs: Vec<char> = frame
+        let glyphs: String = frame
             .iter()
             .map(|&v| FORMAT_ICONS[(v as usize).min(FORMAT_ICONS.len() - 1)])
             .collect();
 
-        // Total advance width of all bar glyphs (monospace → uniform cell width).
-        let total_width: f32 = glyphs
-            .iter()
-            .map(|&c| font.glyph(c).scaled(scale).h_metrics().advance_width)
-            .sum();
-
-        let box_w = 2 * BORDER + 2 * H_PAD + total_width.ceil() as u32;
+        let bar_width = stride / 4;
+        let box_w = 2 * BORDER + 2 * H_PAD + text_width(font, scale, &glyphs).ceil() as u32;
         self.layout = (x_offset, x_offset + box_w);
 
         // Same filled-box primitive as the clock/workspaces/tray/widgets modules,
@@ -205,42 +178,23 @@ impl Cava {
         // Pen: 1px in from the border, 8px h-padding, vertically centered. The
         // block glyphs sit at the bottom of their cell, so bars grow upward from
         // the lower part of the centered cell — the correct visualizer look.
-        let mut pen = point(
+        draw_text(
+            font,
+            scale,
+            canvas,
+            stride,
+            (bar_width, height),
+            &glyphs,
             x_offset as f32 + BORDER as f32 + H_PAD as f32,
             (height as f32 - glyph_height) / 2.0 + v_metrics.ascent,
+            accent(),
         );
-        let bar_width = stride / 4;
+    }
 
-        for &c in &glyphs {
-            let glyph = font.glyph(c);
-            let scaled_glyph = glyph.scaled(scale);
-            let advance_width = scaled_glyph.h_metrics().advance_width;
-            let positioned_glyph = scaled_glyph.positioned(pen);
-            if let Some(bb) = positioned_glyph.pixel_bounding_box() {
-                positioned_glyph.draw(|x_rel, y_rel, v| {
-                    let xi = bb.min.x + x_rel as i32;
-                    let yi = bb.min.y + y_rel as i32;
-                    if xi >= 0 && (xi as u32) < bar_width && yi >= 0 && (yi as u32) < height {
-                        let off = yi as usize * stride as usize + xi as usize * 4;
-                        if off + 3 < canvas.len() {
-                            // gamma-correct coverage + premultiplied src-over,
-                            // same as the clock/workspaces text so accent
-                            // composites correctly over the box fill.
-                            let gv = v.powf(1.0 / 2.2);
-                            let src = accent().bgr(); // b, g, r
-                            for c in 0..3 {
-                                let s = src[c] * gv;
-                                let d = canvas[off + c] as f32;
-                                canvas[off + c] = (s + d * (1.0 - gv)).min(255.0) as u8;
-                            }
-                            let da = canvas[off + 3] as f32;
-                            canvas[off + 3] = (255.0 * gv + da * (1.0 - gv)).min(255.0) as u8;
-                        }
-                    }
-                });
-            }
-            pen.x += advance_width;
-        }
+    /// Total pixel width this module occupies on the left of the bar, as laid out
+    /// by the last render.
+    pub fn width(&self) -> u32 {
+        self.layout.1.saturating_sub(self.layout.0)
     }
 
     /// Whether the given bar-local x falls inside the last-rendered cava box.
