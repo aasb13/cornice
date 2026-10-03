@@ -48,6 +48,15 @@ impl Color {
     pub fn bgr(self) -> [f32; 3] {
         [self.b as f32, self.g as f32, self.r as f32]
     }
+
+    /// `self` moved `t` of the way toward `other`. `t` is clamped to 0..=1, so
+    /// callers can feed it a ratio computed from geometry without clamping at
+    /// every call site.
+    pub fn lerp(self, other: Color, t: f32) -> Color {
+        let t = t.clamp(0.0, 1.0);
+        let m = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+        Color::rgb(m(self.r, other.r), m(self.g, other.g), m(self.b, other.b))
+    }
 }
 
 impl std::str::FromStr for Color {
@@ -251,6 +260,24 @@ mod tests {
         ] {
             assert_eq!(c.to_string().parse::<Color>().unwrap(), c);
         }
+    }
+
+    #[test]
+    fn lerp_hits_both_ends_and_midpoints() {
+        let black = Color::rgb(0, 0, 0);
+        let white = Color::rgb(255, 255, 255);
+        assert_eq!(black.lerp(white, 0.0), black);
+        assert_eq!(black.lerp(white, 1.0), white);
+        assert_eq!(black.lerp(white, 0.5), Color::rgb(128, 128, 128));
+        // Out-of-range ratios clamp rather than wrapping or panicking: the
+        // visualiser feeds it depth/height ratios that can land just outside
+        // 0..=1 at the top and bottom of a column.
+        assert_eq!(black.lerp(white, -3.0), black);
+        assert_eq!(black.lerp(white, 9.0), white);
+        assert_eq!(
+            Color::rgb(10, 20, 30).lerp(Color::rgb(20, 40, 60), 0.5),
+            Color::rgb(15, 30, 45)
+        );
     }
 
     #[test]

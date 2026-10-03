@@ -166,6 +166,53 @@ pub(crate) fn fill_rect(
     }
 }
 
+/// A 1px line from (`x0`, `y0`) to (`x1`, `y1`), inclusive of both ends.
+///
+/// Bresenham, stepping along whichever axis is longer so the line never
+/// double-steps a diagonal and leaves gaps in it. Coordinates outside `bounds`
+/// are skipped, like every other primitive here — the visualiser's trace runs
+/// to the very edge of its box, so a peak that overshoots loses the overflow
+/// rather than scribbling past the border or panicking.
+///
+/// `bounds` is the `(width, height)` of the surface in pixels, and the
+/// coordinates are surface-absolute, matching [`draw_text`]'s convention.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_line(
+    canvas: &mut [u8],
+    stride: u32,
+    bounds: (u32, u32),
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: Color,
+) {
+    let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
+    let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
+    let mut err = dx - dy;
+    let (mut x, mut y) = (x0, y0);
+    loop {
+        if x >= 0 && y >= 0 && (x as u32) < bounds.0 && (y as u32) < bounds.1 {
+            let off = y as usize * stride as usize + x as usize * 4;
+            if off + 3 < canvas.len() {
+                canvas[off..off + 4].copy_from_slice(&color.to_bgra(255));
+            }
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
 /// A filled rectangle with a 1px border on all four edges — the waybar
 /// outlined-box primitive (clock, workspaces, cava, tray, widget strip). The
 /// border is drawn on the outer 1px of the rect.
@@ -228,6 +275,67 @@ mod tests {
                 .all(|(i, &b)| b != 0 || !(8..12).contains(&i)),
             "the fill leaked outside its single pixel: {canvas:?}"
         );
+    }
+
+    /// A line has to actually connect its endpoints and stay 1px thick, and it
+    /// has to be *continuous* — Bresenham that steps both axes unconditionally
+    /// leaves a diagonal gap on every other pixel, which on the visualiser's
+    /// trace shows up as a visibly dashed line rather than a solid one.
+    #[test]
+    fn draw_line_connects_its_endpoints_without_gaps() {
+        let (w, h) = (40u32, 40u32);
+        let stride = w * 4;
+        let white = Color::rgb(0xff, 0xff, 0xff);
+
+        // A 45° diagonal: the hard case for gap-free stepping.
+        let mut canvas = vec![0u8; (stride * h) as usize];
+        draw_line(&mut canvas, stride, (w, h), 4, 4, 20, 20, white);
+        let lit = |c: &[u8], x: u32, y: u32| c[(y * stride + x * 4) as usize + 3] != 0;
+        for i in 4..=20u32 {
+            assert!(lit(&canvas, i, i), "gap on the diagonal at ({i},{i})");
+        }
+
+        // Horizontal and vertical runs are exact, single-row/column, and reach
+        // both ends.
+        let mut canvas = vec![0u8; (stride * h) as usize];
+        draw_line(&mut canvas, stride, (w, h), 5, 10, 25, 10, white);
+        for x in 5..=25u32 {
+            assert!(lit(&canvas, x, 10), "horizontal gap at x={x}");
+            assert!(
+                !(x >= 5 && x <= 25 && lit(&canvas, x, 9))
+                    && !(x >= 5 && x <= 25 && lit(&canvas, x, 11)),
+                "horizontal line bled onto a second row at x={x}"
+            );
+        }
+        let mut canvas = vec![0u8; (stride * h) as usize];
+        draw_line(&mut canvas, stride, (w, h), 10, 5, 10, 25, white);
+        for y in 5..=25u32 {
+            assert!(lit(&canvas, 10, y), "vertical gap at y={y}");
+        }
+
+        // A zero-length line still marks its point, so a flat trace segment
+        // (both ends at the same y) is visible rather than invisible.
+        let mut canvas = vec![0u8; (stride * h) as usize];
+        draw_line(&mut canvas, stride, (w, h), 7, 7, 7, 7, white);
+        assert!(lit(&canvas, 7, 7), "a zero-length line drew nothing");
+    }
+
+    /// The trace runs edge to edge, so the endpoints land on the last pixel of
+    /// the box rather than one past it.
+    #[test]
+    fn draw_line_clips_instead_of_panicking() {
+        let mut canvas = [0u8; 4 * 4];
+        let white = Color::rgb(0xff, 0xff, 0xff);
+        for (a, b) in [
+            ((-50i32, -50i32), (2, 2)),
+            ((2, 2), (500, 500)),
+            ((-500, 2), (500, -500)),
+            ((0, 0), (0, 0)),
+        ] {
+            draw_line(&mut canvas, 4, (1, 1), a.0, a.1, b.0, b.1, white);
+        }
+        // Nothing wrote outside the 1x1 pixel surface.
+        assert!(canvas[4..].iter().all(|&b| b == 0), "{canvas:?}");
     }
 
     /// Out-of-range writes are skipped rather than panicking; a colour change
@@ -555,26 +663,72 @@ mod module_rendering {
         assert_boxed_in(&canvas, 0, ws.width());
     }
 
+    /// The visualiser used to draw 14 block glyphs sized from `text_width`, so
+    /// this test checked its box against that measurement. It now draws a
+    /// polyline of fixed geometry instead, which means two different things are
+    /// worth pinning instead: that a *known* frame lands where the geometry says
+    /// it should (so the trace isn't drawn at some arbitrary scale), and that
+    /// nothing escapes the box — the wash fills every column down to the
+    /// baseline, so an off-by-one in the plot area would scribble past the border
+    /// rather than merely look wrong.
     #[test]
-    fn the_visualiser_draws_a_bar_per_channel() {
-        let Some(_) = font() else { return };
+    fn the_visualiser_draws_its_trace_inside_its_box() {
         let mut canvas = blank();
         let mut cava = Cava::new();
-        cava.render(&palette(), &mut canvas, 200, H, W * 4);
+        // A ramp: silent at the left edge, loudest at the right. The envelope
+        // needs a few frames to climb, so render repeatedly — which also stands
+        // in for a running bar.
+        cava.set_frame(&(0..14).map(|i| i * 8).collect::<Vec<u8>>());
+        for _ in 0..20 {
+            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+        }
         assert!(ink(&canvas) > 100, "the visualiser drew almost nothing");
+        assert_boxed_in(&canvas, 200, cava.width());
 
-        // The box is sized as `2 * BORDER + 2 * H_PAD + text_width(...)`, so with
-        // the frame still all zeros every bar is the lowest block element. This
-        // pins that the module sizes its box with the *shared* measurement
-        // rather than an inline sum of advances of its own — the two used to
-        // drift apart without anything noticing. Whether `text_width` itself is
-        // right is `drawn_ink_agrees_with_the_measured_width`'s job; comparing
-        // against it here would only prove it agrees with itself.
-        let font = font().unwrap();
-        let bars = "\u{2581}".repeat(14);
-        let box_w =
-            2 + 2 * 8 + text_width(font, Scale::uniform(H as f32 * 0.5), &bars).ceil() as u32;
-        assert_boxed_in(&canvas, 200, box_w);
+        // The quiet end of the ramp must sit near the baseline and the loud end
+        // near the top: a trace that ignored the frame, or plotted it inverted,
+        // would put them the other way up or at the same height.
+        //
+        // "Ink" here means *not the box fill*. The fill is opaque black, so
+        // `alpha != 0` would call the entire interior painted and both ends
+        // would report the top border row.
+        let px = canvas.as_chunks::<4>().0;
+        let painted = |x: u32, y: u32| -> bool { px[(y * W + x) as usize][..3] != [0, 0, 0] };
+        let topmost = |from: u32, to: u32| -> Option<u32> {
+            let x = (from..to).find(|&x| (1..H - 1).any(|y| painted(x, y)))?;
+            Some((1..H - 1).find(|&y| painted(x, y)).unwrap())
+        };
+        let left = 200 + 1 + 8; // box border + h-padding
+        let quiet = topmost(left, left + 3).expect("no ink at the quiet end");
+        let loud = topmost(left + 70, left + 78).expect("no ink at the loud end");
+        assert!(
+            loud < quiet,
+            "the loud end of the ramp should draw higher up than the quiet end, \
+             but they were at rows {loud} and {quiet}"
+        );
+    }
+
+    /// A silent frame has to look like a flat line resting on the baseline rule,
+    /// not like an empty box — otherwise "nothing playing" and "the module is
+    /// broken" are the same picture.
+    #[test]
+    fn a_silent_visualiser_still_draws_its_baseline() {
+        let mut canvas = blank();
+        let mut cava = Cava::new();
+        for _ in 0..5 {
+            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+        }
+        let px = canvas.as_chunks::<4>().0;
+        let left = 200 + 1 + 8;
+        // Not the box fill, which is opaque black across the whole interior.
+        let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
+        let baseline_rows: Vec<u32> = (H - 6..H - 2)
+            .filter(|&y| (left..left + 60).any(|x| painted(x, y)))
+            .collect();
+        assert!(
+            !baseline_rows.is_empty(),
+            "a silent visualiser drew nothing near its baseline"
+        );
     }
 
     /// The palette used to be a process global, so a module could have kept
