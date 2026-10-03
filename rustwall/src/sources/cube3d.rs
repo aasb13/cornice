@@ -1,13 +1,27 @@
-//! A properly-rotating 4D ASCII tesseract (hypercube).
+//! A slowly rotating spiky cube in ASCII, with Matrix rain.
 //!
-//! This is a real 4D render, not a sketch: the sixteen tesseract vertices are
-//! rotated through the XW, YW and ZW planes every frame (the signature
-//! rotations that make a hypercube visibly "turn inside out"), perspective-
-//! projected from 4D down to 3D along the fourth axis, spun again with the
-//! ordinary 3D rotation, and then the 32 edges are stroked onto the cell grid.
-//! Each edge is depth-shaded to the ASCII ramp so the whole thing reads as a
-//! solid, rotating tesseract in glyphs; that same brightness also scales the
-//! glyph colour, so a dimmer cell is drawn with a dimmer colour too.
+//! TEMPORARY: this replaces a properly-rotating 4D tesseract, whose geometry
+//! tables and 4D rotate/project helpers are commented out below. To restore it,
+//! delete this banner and the spike geometry (`CUBE_*`, `CORNER_SPIKES`,
+//! `FACE_SPIKES`, `SEG_COUNT`, `ANCHOR_COUNT`, `SEG`, `Figure`, `figure`,
+//! `spike_variation`), then uncomment the tesseract blocks and restore
+//! `render`'s segment building. Nothing else depends on the swap: the figure is
+//! built from segments exactly as the tesseract's edges were, so the grid, ramp,
+//! depth sort and blit are all unchanged.
+//!
+//! The figure is a cube at (±1,±1,±1) with a spike growing out of each of its 8
+//! corners along that corner's own space diagonal, plus optionally one out of
+//! each face centre. Corner spikes start *at* the corner rather than at the
+//! origin, so each is a continuation of the three cube edges meeting there —
+//! that, plus the cube's own 12 edges, is what makes it read as a solid in three
+//! dimensions. Spikes radiating from the origin instead do not: with no closed
+//! structure to occlude them and no perspective, they render as a flat
+//! starburst. See the `figure` doc comment.
+//!
+//! Every segment is rotated in 3D, perspective-divided toward the viewer, then
+//! stroked onto the cell grid with depth interpolated per step, so the figure
+//! shades smoothly along each line; that same brightness also scales the glyph
+//! colour, so a dimmer cell is drawn with a dimmer colour too.
 //!
 //! Performance notes (this thing runs every frame, so the blit path is the
 //! hot loop — several thousand glyphs are stamped per frame):
@@ -93,7 +107,9 @@ struct DepthRange {
 }
 
 impl DepthRange {
-    fn new(depths: &[f32; 32]) -> Self {
+    /// Takes any segment count, so the retired tesseract's 32 and the spike
+    /// figure's 28 are both just lengths of the same array.
+    fn new(depths: &[f32]) -> Self {
         let min = depths.iter().fold(f32::INFINITY, |m, &x| m.min(x));
         let max = depths.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
         DepthRange {
@@ -134,36 +150,69 @@ struct Glyph {
     data: Vec<u8>,
 }
 
-/// The sixteen corners of a unit tesseract around the origin. Index bits are
-/// 0=x, 1=y, 2=z, 3=w; each coordinate is +1 when its bit is set else -1.
-const VERTICES: [[f32; 4]; 16] = vertices();
+// TEMPORARY: retired in favour of the spike figure. See the module docs.
+//
+// /// The sixteen corners of a unit tesseract around the origin. Index bits are
+// /// 0=x, 1=y, 2=z, 3=w; each coordinate is +1 when its bit is set else -1.
+// const VERTICES: [[f32; 4]; 16] = vertices();
+//
+// const fn vertices() -> [[f32; 4]; 16] {
+//     let mut v = [[0.0f32; 4]; 16];
+//     let mut i = 0;
+//     while i < 16 {
+//         v[i] = [
+//             if i & 1 == 0 { -1.0 } else { 1.0 },
+//             if i & 2 == 0 { -1.0 } else { 1.0 },
+//             if i & 4 == 0 { -1.0 } else { 1.0 },
+//             if i & 8 == 0 { -1.0 } else { 1.0 },
+//         ];
+//         i += 1;
+//     }
+//     v
+// }
+//
+// /// The 32 edges: each vertex connects to the four neighbours that differ in
+// /// exactly one coordinate, pairing each undirected edge once.
+// const EDGES: [[usize; 2]; 32] = edges();
+//
+// const fn edges() -> [[usize; 2]; 32] {
+//     let mut e = [[0usize; 2]; 32];
+//     let mut n = 0;
+//     let mut v = 0;
+//     while v < 16 {
+//         let mut bit = 0;
+//         while bit < 4 {
+//             let nbr = v ^ (1 << bit);
+//             if v < nbr {
+//                 e[n][0] = v;
+//                 e[n][1] = nbr;
+//                 n += 1;
+//             }
+//             bit += 1;
+//         }
+//         v += 1;
+//     }
+//     e
+// }
 
-const fn vertices() -> [[f32; 4]; 16] {
-    let mut v = [[0.0f32; 4]; 16];
-    let mut i = 0;
-    while i < 16 {
-        v[i] = [
-            if i & 1 == 0 { -1.0 } else { 1.0 },
-            if i & 2 == 0 { -1.0 } else { 1.0 },
-            if i & 4 == 0 { -1.0 } else { 1.0 },
-            if i & 8 == 0 { -1.0 } else { 1.0 },
-        ];
-        i += 1;
-    }
-    v
-}
+/// The eight corners of the cube body, at (±1, ±1, ±1). Index bits select the
+/// sign of each axis, matching [`cube_edges`].
+const CUBE_VERTS: usize = 8;
 
-/// The 32 edges: each vertex connects to the four neighbours that differ in
-/// exactly one coordinate, pairing each undirected edge once.
-const EDGES: [[usize; 2]; 32] = edges();
+/// A cube has 12 edges.
+const CUBE_EDGES: usize = 12;
 
-const fn edges() -> [[usize; 2]; 32] {
-    let mut e = [[0usize; 2]; 32];
+/// The cube's 12 edges: each corner connects to the three neighbours differing
+/// in exactly one bit, pairing each undirected edge once.
+const CUBE_EDGE_TABLE: [[usize; 2]; CUBE_EDGES] = cube_edges();
+
+const fn cube_edges() -> [[usize; 2]; CUBE_EDGES] {
+    let mut e = [[0usize; 2]; CUBE_EDGES];
     let mut n = 0;
     let mut v = 0;
-    while v < 16 {
+    while v < CUBE_VERTS {
         let mut bit = 0;
-        while bit < 4 {
+        while bit < 3 {
             let nbr = v ^ (1 << bit);
             if v < nbr {
                 e[n][0] = v;
@@ -176,6 +225,51 @@ const fn edges() -> [[usize; 2]; 32] {
     }
     e
 }
+
+/// Face-spike direction: straight out along each of the 6 face normals.
+/// Sized independently of [`FACE_SPIKES`] so the table stays fixed at 6 while
+/// the count of spikes actually drawn is a separate knob.
+const FACE_DIRS: [[f32; 3]; 6] = [
+    [1.0, 0.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, -1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, -1.0],
+];
+
+/// A spike grows out of each of the 8 cube corners, along the corner diagonal
+/// (the direction from the centre through that corner), which is what makes the
+/// figure read as a spiky cube rather than a bare box.
+const CORNER_SPIKES: usize = 8;
+
+/// A spike out of the centre of each face, along the face normal. Zero by
+/// default: they start at the cube's centre, so they cross the whole figure and
+/// turn the silhouette back into a flat starburst. The corner spikes alone keep
+/// the cube readable.
+const FACE_SPIKES: usize = 0;
+
+/// Total segments drawn per frame: the cube's wireframe plus every spike.
+const SEG_COUNT: usize = CUBE_EDGES + CORNER_SPIKES + FACE_SPIKES;
+
+/// Points that get the heavy `vertex_glyph` stamp: the 8 cube corners and the
+/// 8 corner-spike tips.
+const ANCHOR_COUNT: usize = CUBE_VERTS + CORNER_SPIKES;
+
+/// How far a corner spike's tip sits from the centre, in world units. The
+/// cube's corners are at distance sqrt(3) ≈ 1.73, so this is how much further
+/// out past the corner the spike reaches.
+const CORNER_SPIKE_LEN: f32 = 3.4;
+
+/// How far a face spike's tip sits from the centre, in world units. The cube's
+/// faces are at distance 1.0.
+const FACE_SPIKE_LEN: f32 = 2.6;
+
+/// Peak fractional deviation of a spike's length from its steady value.
+const SPIKE_PULSE: f32 = 0.22;
+
+/// Spike breathing rate, radians per second.
+const SPIKE_PULSE_SPEED: f32 = 1.1;
 
 pub struct RotatingTesseract {
     font: Option<Font<'static>>,
@@ -226,7 +320,7 @@ pub struct RotatingTesseract {
     /// over the rain pool. Built on demand (one scale at a time) and shared
     /// by every wall that draws at that scale.
     rain_atlas: HashMap<u32, Vec<Arc<Glyph>>>,
-    /// The tesseract's cell grid, allocated once and cleared each frame.
+    /// The figure's cell grid, allocated once and cleared each frame.
     /// Holds `Some((ramp glyph index, brightness))` per lit cell.
     grid: Vec<Option<(u8, f32)>>,
 }
@@ -269,6 +363,23 @@ impl RotatingTesseract {
             rain_atlas: HashMap::new(),
             grid: Vec::new(),
         }
+    }
+
+    /// Per-spike length and breathing phase, derived from a small integer hash
+    /// of the spike's index so the figure is varied but fully deterministic —
+    /// no RNG state, and the same wall looks identical on every reload.
+    ///
+    /// Returns `(length_multiplier, phase)`. Lengths vary a little so the spikes
+    /// read as a natural cluster rather than a perfect caltrop.
+    fn spike_variation(i: usize) -> (f32, f32) {
+        // A couple of xorshift rounds over the index, hashed to two floats.
+        let mut x = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let a = ((x >> 40) as f32) / ((1u64 << 24) as f32); // [0,1)
+        let b = ((x >> 8) & 0xFF_FFFF) as f32 / ((1u64 << 24) as f32); // [0,1)
+        (0.82 + 0.30 * a, b * std::f32::consts::TAU)
     }
 
     /// The font size the tesseract — and the rain's nominal size — is drawn at.
@@ -657,18 +768,20 @@ impl RotatingTesseract {
         }
     }
 
-    /// Rotate a 4D point in the XW, YW, then ZW planes (radians). These are
-    /// the rotations that keep the hypercube inside its own 4D space while
-    /// making its 3D shadow appear to turn inside out.
-    fn rotate4(p: [f32; 4], axw: f32, ayw: f32, azw: f32) -> [f32; 4] {
-        let (c1, s1) = (axw.cos(), axw.sin());
-        let (x, w1) = (p[0] * c1 - p[3] * s1, p[0] * s1 + p[3] * c1); // XW
-        let (c2, s2) = (ayw.cos(), ayw.sin());
-        let (y, w2) = (p[1] * c2 - w1 * s2, p[1] * s2 + w1 * c2); // YW
-        let (c3, s3) = (azw.cos(), azw.sin());
-        let (z, w3) = (p[2] * c3 - w2 * s3, p[2] * s3 + w2 * c3); // ZW
-        [x, y, z, w3]
-    }
+    // TEMPORARY: unused by the spike figure. See the module docs.
+//
+//     /// Rotate a 4D point in the XW, YW, then ZW planes (radians). These are
+//     /// the rotations that keep the hypercube inside its own 4D space while
+//     /// making its 3D shadow appear to turn inside out.
+//     fn rotate4(p: [f32; 4], axw: f32, ayw: f32, azw: f32) -> [f32; 4] {
+//         let (c1, s1) = (axw.cos(), axw.sin());
+//         let (x, w1) = (p[0] * c1 - p[3] * s1, p[0] * s1 + p[3] * c1); // XW
+//         let (c2, s2) = (ayw.cos(), ayw.sin());
+//         let (y, w2) = (p[1] * c2 - w1 * s2, p[1] * s2 + w1 * c2); // YW
+//         let (c3, s3) = (azw.cos(), azw.sin());
+//         let (z, w3) = (p[2] * c3 - w2 * s3, p[2] * s3 + w2 * c3); // ZW
+//         [x, y, z, w3]
+//     }
 
     /// Rotate a 3D point/direction about X, then Y, then Z (radians).
     fn rotate(p: [f32; 3], ax: f32, ay: f32, az: f32) -> [f32; 3] {
@@ -751,12 +864,14 @@ impl RotatingTesseract {
         }
     }
 
-    /// Perspective-project a 4D point to 3D along the w axis, with the
-    /// observer at w = `dist`, the same way a 3D point projects to 2D.
-    fn project4(p: [f32; 4], dist: f32) -> [f32; 3] {
-        let s = dist / (dist - p[3]);
-        [p[0] * s, p[1] * s, p[2] * s]
-    }
+    // TEMPORARY: unused by the spike figure. See the module docs.
+//
+//     /// Perspective-project a 4D point to 3D along the w axis, with the
+//     /// observer at w = `dist`, the same way a 3D point projects to 2D.
+//     fn project4(p: [f32; 4], dist: f32) -> [f32; 3] {
+//         let s = dist / (dist - p[3]);
+//         [p[0] * s, p[1] * s, p[2] * s]
+//     }
 
     /// Rasterize one glyph at the given scale into a coverage mask. This is
     /// the expensive part (font outline tracing + AA rasterize), so it runs
@@ -1109,6 +1224,150 @@ impl RotatingTesseract {
     }
 }
 
+/// One projected segment, in grid-cell coordinates, with the depth it sorts by.
+#[derive(Clone, Copy)]
+struct Seg {
+    a: [f32; 2],
+    b: [f32; 2],
+    depth: f32,
+}
+
+/// The whole figure for one frame: every segment in grid coordinates, plus the
+/// junction points that take the heavy vertex glyph.
+///
+/// Split out of `render` and free of any drawing so the geometry can be
+/// inspected on its own (see the tests) — the shape is the part that's hard to
+/// debug from a moving wallpaper.
+struct Figure {
+    segs: [Seg; SEG_COUNT],
+    anchors: [[f32; 2]; ANCHOR_COUNT],
+    anchor_depths: [f32; ANCHOR_COUNT],
+}
+
+impl RotatingTesseract {
+    /// Build one frame of the spiky cube.
+    ///
+    /// The figure is a cube at (±1,±1,±1) with a spike growing out of each of
+    /// its 8 corners along that corner's own space diagonal, plus one out of
+    /// each of the 6 face centres. Corner spikes start at the corner rather
+    /// than at the origin, so each is a continuation of the three edges meeting
+    /// there; that, plus the cube's own 12 edges, is what reads as three
+    /// dimensions rather than a flat starburst.
+    ///
+    /// `kx`/`ky` convert world units to grid columns/rows, and `(cols_c,
+    /// rows_c)` is the grid position the world origin maps to.
+    fn figure(&self, elapsed: f32, kx: f32, ky: f32, cols_c: f32, rows_c: f32) -> Figure {
+        let rot = &self.cfg.rotation;
+        let (ax, ay, az) = (elapsed * rot.x, elapsed * rot.y, elapsed * rot.z);
+
+        // The camera sits this many figure-radii back, multiplied by the configured
+        // `perspective`. It has to scale with the figure: a fixed distance would
+        // be gentle for a ±1 shape and violently fisheyed for one whose spikes
+        // reach past 2, since the magnification at the near tip is dist/(dist-r).
+        let reach = CORNER_SPIKE_LEN
+            .max(FACE_SPIKE_LEN)
+            * (1.0 + SPIKE_PULSE)
+            * 1.15;
+        // Dividing x/y by the camera distance is the figure's main depth cue:
+        // without it the wireframe is orthographic and every part is the same
+        // size on screen, which reads as a flat diagram rather than a solid.
+        let dist = reach * self.cfg.perspective;
+        let persp = |p: [f32; 3]| {
+            let s = dist / (dist + p[2]);
+            [p[0] * s, p[1] * s, p[2]]
+        };
+        // World -> grid. The Y flip is because grid row 0 is the top of the
+        // screen while world +y is up.
+        let to_grid = |p: [f32; 2]| [p[0] * kx + cols_c, -p[1] * ky + rows_c];
+
+        // The 8 cube corners, as sign patterns over the three bits.
+        let corner_at = |i: usize| {
+            [
+                if i & 1 == 0 { -1.0 } else { 1.0 },
+                if i & 2 == 0 { -1.0 } else { 1.0 },
+                if i & 4 == 0 { -1.0 } else { 1.0 },
+            ]
+        };
+
+        let sqrt3 = 3.0f32.sqrt();
+        let mut corners = [[0.0f32; 2]; CUBE_VERTS];
+        let mut corner_z = [0.0f32; CUBE_VERTS];
+        let mut tips = [[0.0f32; 2]; CORNER_SPIKES];
+        let mut tip_z = [0.0f32; CORNER_SPIKES];
+        for i in 0..CUBE_VERTS {
+            let base = corner_at(i);
+            let p = persp(Self::rotate(base, ax, ay, az));
+            corners[i] = to_grid([p[0], p[1]]);
+            corner_z[i] = p[2];
+
+            // Spike: the corner, pushed out along its own diagonal. The corner
+            // sits at distance sqrt(3) from the origin, so scaling the sign
+            // pattern by reach/sqrt(3) lands the tip at distance `reach`.
+            let (mul, phase) = Self::spike_variation(i);
+            let breathe = 1.0 + SPIKE_PULSE * (elapsed * SPIKE_PULSE_SPEED + phase).sin();
+            let reach = CORNER_SPIKE_LEN * mul * breathe;
+            let k = reach / sqrt3;
+            let t = persp(Self::rotate([base[0] * k, base[1] * k, base[2] * k], ax, ay, az));
+            tips[i] = to_grid([t[0], t[1]]);
+            tip_z[i] = t[2];
+        }
+
+        let mut segs = [Seg {
+            a: [0.0; 2],
+            b: [0.0; 2],
+            depth: 0.0,
+        }; SEG_COUNT];
+        let mut s = 0;
+        // The cube's wireframe first, so a spike index is a constant offset.
+        for e in CUBE_EDGE_TABLE.iter() {
+            segs[s] = Seg {
+                a: corners[e[0]],
+                b: corners[e[1]],
+                depth: (corner_z[e[0]] + corner_z[e[1]]) * 0.5,
+            };
+            s += 1;
+        }
+        // Corner spikes: corner -> tip.
+        for i in 0..CORNER_SPIKES {
+            segs[s] = Seg {
+                a: corners[i],
+                b: tips[i],
+                depth: (corner_z[i] + tip_z[i]) * 0.5,
+            };
+            s += 1;
+        }
+        // Face spikes: the cube's centre -> tip. These are the only segments
+        // that start at the origin, which projects to the grid centre.
+        for (i, d) in FACE_DIRS.iter().take(FACE_SPIKES).enumerate() {
+            let (mul, phase) = Self::spike_variation(CORNER_SPIKES + i);
+            let breathe = 1.0 + SPIKE_PULSE * (elapsed * SPIKE_PULSE_SPEED + phase).sin();
+            let reach = FACE_SPIKE_LEN * mul * breathe;
+            let t = persp(Self::rotate([d[0] * reach, d[1] * reach, d[2] * reach], ax, ay, az));
+            segs[s] = Seg {
+                a: [cols_c, rows_c],
+                b: to_grid([t[0], t[1]]),
+                depth: t[2] * 0.5,
+            };
+            s += 1;
+        }
+
+        // Junctions first, spike tips after, so the loop below reads in the
+        // same order the caller draws them.
+        let mut anchors = [[0.0f32; 2]; ANCHOR_COUNT];
+        let mut anchor_depths = [0.0f32; ANCHOR_COUNT];
+        anchors[..CUBE_VERTS].copy_from_slice(&corners);
+        anchor_depths[..CUBE_VERTS].copy_from_slice(&corner_z);
+        anchors[CUBE_VERTS..].copy_from_slice(&tips[..CORNER_SPIKES]);
+        anchor_depths[CUBE_VERTS..].copy_from_slice(&tip_z[..CORNER_SPIKES]);
+
+        Figure {
+            segs,
+            anchors,
+            anchor_depths,
+        }
+    }
+}
+
 impl FrameSource for RotatingTesseract {
     fn init(&mut self, width: u32, height: u32) {
         self.width = width;
@@ -1203,7 +1462,7 @@ impl FrameSource for RotatingTesseract {
             }
         }
 
-        log::error!("No font found. Tesseract will not render.");
+        log::error!("No font found. The figure will not render.");
     }
 
     fn tick_interval(&self) -> Option<Duration> {
@@ -1249,115 +1508,80 @@ impl FrameSource for RotatingTesseract {
         self.update_waterfalls(dt);
 
         let elapsed = self.start_time.elapsed().as_secs_f32();
-        // 4D rotations through the three w-planes (the star of the show) plus
-        // a slow ordinary 3D tumble so the shadow keeps moving on screen.
-        let rot = &self.cfg.rotation;
-        let (axw, ayw, azw) = (elapsed * rot.xw, elapsed * rot.yw, elapsed * rot.zw);
-        let (ax, ay, az) = (elapsed * rot.x, elapsed * rot.y, elapsed * rot.z);
 
-        // 1. Rotate all sixteen vertices in 4D.
-        let mut rot4 = [[0.0f32; 4]; 16];
-        for (dst, v) in rot4.iter_mut().zip(VERTICES.iter()) {
-            *dst = Self::rotate4(*v, axw, ayw, azw);
-        }
-
-        // 2. Weak perspective-project 4D -> 3D. The observer sits back at
-        //    `perspective`, so the far half of the hypercube shrinks and the near
-        //    half enlarges gently — enough to show the inner/outer cells sliding
-        //    apart without the whole shape lunging at the camera.
-        let mut p3 = [[0.0f32; 3]; 16];
-        let dist = self.cfg.perspective;
-        for (dst, v) in p3.iter_mut().zip(rot4.iter()) {
-            *dst = Self::project4(*v, dist);
-        }
-
-        // 3. Ordinary 3D rotation for extra motion.
-        let mut pts3 = [[0.0f32; 3]; 16];
-        for (dst, v) in pts3.iter_mut().zip(p3.iter()) {
-            *dst = Self::rotate(*v, ax, ay, az);
-        }
-
-        // 4. Map to grid with a *fixed* pixels-per-unit scale so the tesseract
-        //    keeps a steady size and rotates in place. We never re-fit to the
-        //    momentary extent each frame — that used to make the shape snap
-        //    larger/smaller and appear to fling toward the camera.
-        let units_px = (width as f32).min(height as f32) * self.cfg.scale; // px per world unit
+        // Map world units to the cell grid with a *fixed* pixels-per-unit scale,
+        // so the figure keeps a steady size and rotates in place. Never re-fit to
+        // the momentary extent each frame — that would make it snap larger/smaller
+        // and appear to lunge at the camera.
+        let units_px = (width as f32).min(height as f32) * self.cfg.scale;
         let kx = units_px / self.char_width; // cols per world unit
         let ky = units_px / self.char_height; // rows per world unit
         let cols_c = (self.grid_cols - 1) as f32 / 2.0;
         let rows_c = (self.grid_rows - 1) as f32 / 2.0;
 
-        let mut grid_pts = [[0.0f32; 2]; 16];
-        for (dst, v) in grid_pts.iter_mut().zip(pts3.iter()) {
-            dst[0] = v[0] * kx + cols_c;
-            dst[1] = -v[1] * ky + rows_c; // flip Y (screen is upside down)
-        }
-
-        // 5. Per-edge depth values.
-        let mut depths = [0.0f32; 32];
-        for (k, e) in EDGES.iter().enumerate() {
-            depths[k] = (pts3[e[0]][2] + pts3[e[1]][2]) * 0.5;
-        }
-        let depth = DepthRange::new(&depths);
+        let fig = self.figure(elapsed, kx, ky, cols_c, rows_c);
+        let seg_depths: [f32; SEG_COUNT] = fig.segs.map(|s| s.depth);
+        let depth = DepthRange::new(&seg_depths);
 
         // The cell grid is kept between frames to avoid reallocating it, so it
-        // has to be wiped here: every cell lit by the *previous* frame's edges
-        // and vertices is still set, and without this the shape smears into a
-        // solid blob and keeps drawing cells forever.
+        // has to be wiped here: every cell lit by the *previous* frame is still
+        // set, and without this the figure smears into a solid blob and keeps
+        // drawing cells forever.
         self.grid.fill(None);
 
-        // 6. Paint farthest -> nearest so nearer edges overlap the farther
-        //    ones: a 32-byte index array sorted by depth, rather than building
-        //    and sorting a vector of segment structs every frame.
-        let mut order = [0u8; 32];
+        // Paint farthest -> nearest so nearer segments overlap farther ones: a
+        // small index array sorted by depth, rather than building and sorting a
+        // vector of segment structs every frame.
+        let mut order = [0u8; SEG_COUNT];
         for (i, o) in order.iter_mut().enumerate() {
             *o = i as u8;
         }
         order.sort_unstable_by(|&a, &b| {
-            depths[a as usize]
-                .partial_cmp(&depths[b as usize])
+            seg_depths[a as usize]
+                .partial_cmp(&seg_depths[b as usize])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let cols = self.grid_cols;
         let ramp_len = self.ramp.len();
         for &k in order.iter() {
-            let e = EDGES[k as usize];
+            let seg = fig.segs[k as usize];
             Self::draw_line(
                 &mut self.grid,
                 cols,
                 ramp_len,
-                grid_pts[e[0]],
-                grid_pts[e[1]],
-                pts3[e[0]][2],
-                pts3[e[1]][2],
+                seg.a,
+                seg.b,
+                seg.depth,
+                seg.depth,
                 depth,
             );
         }
 
-        // 6b. Stamp the 16 vertices last, unconditionally overwriting whatever
-        // edge-cells piled up underneath them — vertices should always be the
-        // crispest, brightest anchor points in the shape.
-        for (i, p) in grid_pts.iter().enumerate() {
+        // Stamp the 8 corners and 8 spike tips last, unconditionally overwriting
+        // whatever piled up underneath them. Where three edges and a spike meet
+        // in one cell, without a deliberate marker that cell just gets rewritten
+        // by whichever segment draws last and comes out smeared.
+        for i in 0..ANCHOR_COUNT {
             Self::draw_vertex(
                 &mut self.grid,
                 cols,
                 self.grid_rows,
                 self.vertex_index,
-                *p,
-                pts3[i][2],
+                fig.anchors[i],
+                fig.anchor_depths[i],
                 depth,
             );
         }
 
-        // 7. Draw everything onto the canvas. Rain walls go down first and the
-        //    tesseract is painted last, so it always sits above the rain and
+        // 4. Draw everything onto the canvas. Rain walls go down first and the
+        //    figure is painted last, so it always sits above the rain and
         //    remains clearly visible no matter how many walls overlap it.
         let w = width as i32;
         let h = height as i32;
         let stride = stride as usize;
 
-        // 7a. All rain walls (both nearer and farther than the tesseract),
+        // 4a. All rain walls (both nearer and farther than the figure),
         //     or a thinned-out subset of them while on battery.
         for (i, wf) in self.waterfalls.iter().enumerate() {
             if !self.rain_wall_drawn(i) {
@@ -1366,13 +1590,13 @@ impl FrameSource for RotatingTesseract {
             self.draw_waterfall(canvas, w, h, stride, wf);
         }
 
-        // 7b. The tesseract's cells, drawn last so the tesseract is always on top.
+        // 4b. The figure's cells, drawn last so it is always on top.
         let ramp_glyphs = &self.ramp_glyphs;
         let cell_w = self.char_width;
         let cell_h = self.char_height;
         let ox = self.offset_x;
         let oy = self.offset_y;
-        // The tesseract is always drawn at the nominal font size, so its
+        // The figure is always drawn at the nominal font size, so its
         // baseline shift is just the ascent.
         let ascent = self.ascent;
         let tess_color = self.cfg.tesseract_color;
@@ -1405,6 +1629,114 @@ mod tests {
     use super::*;
     use crate::config::PowerSaveConfig;
     use crate::config::cube3d::{F32Range, RainConfig, U32Range};
+
+    /// Render the real figure through the real code path and print it.
+    ///
+    /// Ignored by default; run it with
+    /// `cargo test -p rustwall -- --ignored --nocapture show_figure`. This is
+    /// the only practical way to judge the shape: a wallpaper is not something
+    /// you can check from a passing test, and re-implementing the projection in
+    /// a scratch script is how the shape ends up looking 2D in the preview but
+    /// not on screen (or the other way round).
+    #[test]
+    #[ignore]
+    fn show_figure() {
+        use std::fmt::Write as _;
+
+        let mut cfg = Cube3dConfig::default();
+        cfg.rain.enabled = false;
+        // Pin the rotation so each sampled frame is a known viewing angle: with
+        // the default per-axis speeds these times land on 0, 45, 90, 135 and
+        // 180 degrees, and t=0 is the dead-on axis-aligned view that any
+        // asymmetry in the geometry shows up in immediately.
+        cfg.rotation.x = std::f32::consts::FRAC_PI_4;
+        cfg.rotation.y = std::f32::consts::FRAC_PI_4;
+        cfg.rotation.z = std::f32::consts::FRAC_PI_4;
+        // Character cells are about twice as tall as they are wide, so the figure is
+        // bounded by the row axis: kx = units_px/char_width can be roughly twice
+        // ky, and it is ky that runs out of grid first. Sized so a spike tip
+        // stays well inside a 41-row grid.
+        cfg.scale = 0.10;
+        // Real dimensions for a 1920x1080 screen at the default 24px font, so
+        // the cell counts and the char aspect ratio are the real ones.
+        let (w, h) = (1920u32, 1080u32);
+        let mut src = RotatingTesseract::new(cfg, 60);
+        src.init(w, h);
+        assert!(src.grid_cols > 0, "no font loaded, cannot size the grid");
+
+        let cols = src.grid_cols as usize;
+        let rows = src.grid_rows as usize;
+        let ramp: Vec<char> = src.ramp.iter().map(|&b| b as char).collect();
+
+        for (n, secs) in [0.0f32, 0.7854, 1.5708, 2.356, 3.1416].iter().enumerate() {
+            let cols_c = (src.grid_cols - 1) as f32 / 2.0;
+            let rows_c = (src.grid_rows - 1) as f32 / 2.0;
+            let units_px = h as f32 * src.cfg.scale;
+            let fig = src.figure(
+                *secs,
+                units_px / src.char_width,
+                units_px / src.char_height,
+                cols_c,
+                rows_c,
+            );
+
+            // Paint into a scratch grid exactly as `render` does, so what prints
+            // is the real depth sort, ramp and brightness — not a re-derivation.
+            let mut scratch = vec![None::<(u8, f32)>; cols * rows];
+            let depth = DepthRange::new(&fig.segs.map(|s| s.depth));
+            let mut order = [0u8; SEG_COUNT];
+            for (i, o) in order.iter_mut().enumerate() {
+                *o = i as u8;
+            }
+            let d = fig.segs.map(|s| s.depth);
+            order.sort_unstable_by(|&a, &b| {
+                d[a as usize]
+                    .partial_cmp(&d[b as usize])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for &k in order.iter() {
+                let s = fig.segs[k as usize];
+                RotatingTesseract::draw_line(
+                    &mut scratch,
+                    cols as u32,
+                    ramp.len(),
+                    s.a,
+                    s.b,
+                    s.depth,
+                    s.depth,
+                    depth,
+                );
+            }
+            for i in 0..ANCHOR_COUNT {
+                RotatingTesseract::draw_vertex(
+                    &mut scratch,
+                    cols as u32,
+                    rows as u32,
+                    src.vertex_index,
+                    fig.anchors[i],
+                    fig.anchor_depths[i],
+                    depth,
+                );
+            }
+
+            println!("\n=== t={secs}s  grid {cols}x{rows} ===");
+            let mut line = String::new();
+            for y in 0..rows {
+                line.clear();
+                for x in 0..cols {
+                    line.push(match scratch[y * cols + x] {
+                        Some((gi, _)) => ramp[gi as usize % ramp.len()],
+                        None => ' ',
+                    });
+                }
+                println!("{line}");
+            }
+            let lit = scratch.iter().filter(|c| c.is_some()).count();
+            let _ = writeln!(line);
+            println!("frame {n}: {lit} cells lit of {}", cols * rows);
+        }
+        let _ = w;
+    }
 
     /// End-to-end check that a configured colour lands in the right channel.
     ///
