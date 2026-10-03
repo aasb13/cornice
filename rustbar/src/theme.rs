@@ -698,13 +698,49 @@ mod module_rendering {
             let x = (from..to).find(|&x| (1..H - 1).any(|y| painted(x, y)))?;
             Some((1..H - 1).find(|&y| painted(x, y)).unwrap())
         };
-        let left = 200 + 1 + 8; // box border + h-padding
+        let left = 200 + 1; // the box's 1px border; the plot runs to the edges
         let quiet = topmost(left, left + 3).expect("no ink at the quiet end");
-        let loud = topmost(left + 70, left + 78).expect("no ink at the loud end");
+        // The last band sits PITCH px from the last-but-one; sampling the final
+        // columns also checks the plot reaches the right edge.
+        let loud = topmost(left + 112, left + 117).expect("no ink at the loud end");
         assert!(
             loud < quiet,
             "the loud end of the ramp should draw higher up than the quiet end, \
              but they were at rows {loud} and {quiet}"
+        );
+    }
+
+    /// The plot runs edge to edge inside the border — no side padding — so the
+    /// trace's first and last vertices sit on the first and last interior
+    /// columns. The block-glyph version this replaced had 8px of h-padding on
+    /// each side (waybar `#cava { padding: 0 8px }`), which is right for text
+    /// and wrong here: it left the trace floating in the middle of its box.
+    #[test]
+    fn the_trace_reaches_both_edges_of_its_box() {
+        let mut canvas = blank();
+        let mut cava = Cava::new();
+        // Full scale, so every band draws and the extreme columns are painted.
+        cava.set_frame(&[100; 14]);
+        for _ in 0..40 {
+            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+        }
+        let px = canvas.as_chunks::<4>().0;
+        let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
+
+        // Interior columns, i.e. excluding the 1px border on each side.
+        let first = 200 + 1;
+        let last = 200 + cava.width() - 2;
+        for x in [first, first + 1, last - 1, last] {
+            assert!(
+                (1..H - 1).any(|y| painted(x, y)),
+                "column {x} is empty: the plot left a gap at the edge of the box"
+            );
+        }
+        // And the border itself survives — the plot stops *at* it, not through.
+        assert!(painted(200, 1), "the left border was painted over");
+        assert!(
+            painted(200 + cava.width() - 1, 1),
+            "the right border was painted over"
         );
     }
 
@@ -719,7 +755,7 @@ mod module_rendering {
             cava.render(&palette(), &mut canvas, 200, H, W * 4);
         }
         let px = canvas.as_chunks::<4>().0;
-        let left = 200 + 1 + 8;
+        let left = 200 + 1;
         // Not the box fill, which is opaque black across the whole interior.
         let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
         let baseline_rows: Vec<u32> = (H - 6..H - 2)

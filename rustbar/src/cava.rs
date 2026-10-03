@@ -58,9 +58,7 @@ const ASCII_MAX: u8 = 100;
 /// Horizontal distance between adjacent vertices, in pixels. Fixed rather than
 /// derived from the box, so the trace's slope depends on the music and not on
 /// the bar's height.
-const PITCH: u32 = 6;
-/// waybar `#cava` CSS `padding: 0 8px`.
-const H_PAD: u32 = 8;
+const PITCH: u32 = 9;
 /// 1px accent border (waybar `#cava` `border: 1px solid rgb(191,255,217)`).
 const BORDER: u32 = 1;
 
@@ -79,10 +77,12 @@ const PEAK_FALL: f32 = 0.012;
 const PEAK_W: u32 = 2;
 
 /// Width of the plot area in px: the 13 gaps between 14 vertices at [`PITCH`],
-/// plus the 1px the last vertex's stroke occupies.
+/// plus the 1px the last vertex's stroke occupies. The plot runs edge to edge
+/// inside the border — the box's 1px rule is the only thing separating the trace
+/// from the modules beside it, which is what the rest of the bar does.
 const PLOT_W: u32 = (BARS as u32 - 1) * PITCH + 1;
 /// Total box width, so [`Self::width`] and the render agree by construction.
-const BOX_W: u32 = 2 * BORDER + 2 * H_PAD + PLOT_W;
+const BOX_W: u32 = 2 * BORDER + PLOT_W;
 
 /// Config written to a temp file and passed to `cava -p`. Every value mirrors the
 /// waybar config.jsonc `cava` block; the `[output]` section forces the raw ASCII
@@ -265,10 +265,10 @@ impl Cava {
             colors.accent,
         );
 
-        // Plot area: inside the border and the h-padding, and leaving the bottom
-        // row clear for the baseline rule so the trace always has something to
-        // sit on instead of merging into the border.
-        let x0 = x_offset + BORDER + H_PAD;
+        // Plot area: the full interior, edge to edge, with the bottom row kept
+        // clear for the baseline rule so the trace always has something to sit
+        // on instead of merging into the border.
+        let x0 = x_offset + BORDER;
         let top = BORDER;
         let baseline = height.saturating_sub(1 + BORDER);
         let plot_h = baseline.saturating_sub(top);
