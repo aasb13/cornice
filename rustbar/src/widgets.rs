@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use rusttype::Scale;
 
-use crate::theme::{self, accent, bg, draw_bordered_box, draw_text, text_width};
+use crate::config::Colors;
+use crate::theme::{self, draw_bordered_box, draw_text, text_width};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
 const BORDER: u32 = 1;
@@ -132,7 +133,14 @@ impl WidgetStrip {
 
     /// Renders the seamless strip right-aligned to `right_edge`. Returns the
     /// total width consumed (0 if there's nothing to show).
-    pub fn render(&mut self, canvas: &mut [u8], right_edge: u32, height: u32, stride: u32) -> u32 {
+    pub fn render(
+        &mut self,
+        colors: &Colors,
+        canvas: &mut [u8],
+        right_edge: u32,
+        height: u32,
+        stride: u32,
+    ) -> u32 {
         self.maybe_refresh();
         let Some(font) = theme::font() else {
             return 0;
@@ -162,7 +170,16 @@ impl WidgetStrip {
 
         // One seamless box for the whole strip (waybar stats: black bg, 1px
         // accent border; left cap on the first segment, right cap on the last).
-        draw_bordered_box(canvas, stride, box_x, 0, box_w, height, bg(), accent());
+        draw_bordered_box(
+            canvas,
+            stride,
+            box_x,
+            0,
+            box_w,
+            height,
+            colors.background,
+            colors.accent,
+        );
 
         let mut x = box_x + BORDER;
         let y = (height as f32 - glyph_height) / 2.0 + v_metrics.ascent;
@@ -182,7 +199,7 @@ impl WidgetStrip {
                 label,
                 pen_x,
                 y,
-                accent(),
+                colors.accent,
             );
             self.layout.push((*kind, x, x + w));
             x += w;

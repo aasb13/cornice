@@ -81,7 +81,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    theme::init(reload.config());
     wayland_backend::run(
         args.monitor,
         args.height,

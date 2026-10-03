@@ -1,9 +1,14 @@
 //! Drawing primitives shared by every bar module.
 //!
 //! The palette itself is not here — it comes from `~/.config/rustbar/config.toml`
-//! (see [`crate::config`]) and is reached through the accessors below, so a
-//! colour change is a config edit rather than a recompile. The defaults still
-//! match the waybar style this bar was modelled on (`~/.config/waybar/style.css`).
+//! (see [`crate::config`]) and is handed to every draw as a `&Colors`, so a
+//! colour change is a config edit rather than a recompile, and the live palette
+//! is whatever the reload currently holds. The defaults still match the waybar
+//! style this bar was modelled on (`~/.config/waybar/style.css`).
+//!
+//! Nothing here reads a palette on its own. A colour is always a parameter, which
+//! is what lets the bar swap all five of them from one place: the frame is drawn
+//! against the config as it is now, not against whatever was installed at startup.
 //!
 //! Canvas pixels are `wl_shm` argb8888 in native (little-endian) byte order,
 //! i.e. `B, G, R, A` in memory — the reverse of how channels read in a config
@@ -11,73 +16,10 @@
 //! unpacking a tuple by hand.
 
 use std::sync::OnceLock;
-use std::sync::RwLock;
 
 use rusttype::{Font, Scale, point};
 
-use crate::config::{Color, Colors, Config};
-
-/// The loaded palette.
-///
-/// A `RwLock` rather than a `OnceLock` because the config is re-read live: a
-/// colour edit has to swap the palette while the bar is still running, which a
-/// set-once cell cannot express. Reads are an uncontended atomic load plus a
-/// `Colors` copy (five bytes' worth of `Color`), and there are only a handful of
-/// draws per frame — irrelevant next to rasterizing glyphs.
-static COLORS: RwLock<Option<Colors>> = RwLock::new(None);
-
-/// Install or replace the palette. Called at startup, and again on every reload.
-pub fn init(config: &Config) {
-    let mut slot = match COLORS.write() {
-        Ok(slot) => slot,
-        // A poisoned lock means a draw panicked while holding the read guard. The
-        // stored palette is still a valid value, so recover rather than taking
-        // the whole bar down over it.
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    *slot = Some(config.colors.clone());
-}
-
-/// The active palette.
-///
-/// # Panics
-/// If called before [`init`]. Every draw site is reached from
-/// `wayland_backend::run`, which `main` only calls after loading the config, so
-/// this cannot happen in practice.
-pub fn colors() -> Colors {
-    let slot = match COLORS.read() {
-        Ok(slot) => slot,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    slot.as_ref()
-        .expect("theme::init must run before any drawing")
-        .clone()
-}
-
-/// Primary accent — text, borders, active states.
-pub fn accent() -> Color {
-    colors().accent
-}
-
-/// Bar / popup background.
-pub fn bg() -> Color {
-    colors().background
-}
-
-/// Hover background for menu rows.
-pub fn bg_hover() -> Color {
-    colors().background_hover
-}
-
-/// Text drawn on top of an accent-filled workspace button.
-pub fn on_accent() -> Color {
-    colors().on_accent
-}
-
-/// Empty / inactive workspace text.
-pub fn inactive() -> Color {
-    colors().inactive
-}
+use crate::config::Color;
 
 /// Side margin — pixels of empty space left on the left and right edges of
 /// the bar (waybar `config.jsonc` `margin-left` / `margin-right: 20`). Modules
@@ -544,10 +486,21 @@ mod module_rendering {
     use super::*;
     use crate::cava::Cava;
     use crate::clock::Clock;
+    use crate::config::{Color, Colors};
     use crate::workspaces::WorkspaceList;
 
     const W: u32 = 1280;
     const H: u32 = 30;
+
+    /// A frame with nothing in it, the size every module below is drawn at.
+    fn blank() -> Vec<u8> {
+        vec![0u8; (W * H * 4) as usize]
+    }
+
+    /// The palette every test draws with unless it is specifically varying it.
+    fn palette() -> Colors {
+        Colors::default()
+    }
 
     /// Non-background pixels, i.e. anything the module actually painted.
     fn ink(canvas: &[u8]) -> usize {
@@ -582,36 +535,33 @@ mod module_rendering {
     #[test]
     fn the_clock_paints_a_centred_box_and_some_text() {
         let Some(_) = font() else { return };
-        let mut canvas = vec![0u8; (W * H * 4) as usize];
+        let mut canvas = blank();
         let mut clock = Clock::new();
-        clock.render(&mut canvas, 400, 800, H, W * 4);
+        clock.render(&palette(), &mut canvas, 400, 800, H, W * 4);
         assert!(ink(&canvas) > 100, "the clock drew almost nothing");
     }
 
     #[test]
     fn the_workspaces_draw_one_button_per_slot() {
         let Some(_) = font() else { return };
-        let mut canvas = vec![0u8; (W * H * 4) as usize];
+        let mut canvas = blank();
         let mut ws = WorkspaceList::new();
-        ws.render(&mut canvas, 0, H, W * 4);
-        assert_eq!(ws.button_count(), 10, "expected a button per slot");
+        ws.render(&palette(), &mut canvas, 0, H, W * 4);
         assert!(
             ink(&canvas) > 100,
             "the workspace buttons drew almost nothing"
         );
-        // Nothing may escape the container the module itself laid out.
+        // Nothing may escape the container the module itself lays out.
         assert_boxed_in(&canvas, 0, ws.width());
     }
 
     #[test]
     fn the_visualiser_draws_a_bar_per_channel() {
         let Some(_) = font() else { return };
-        let mut canvas = vec![0u8; (W * H * 4) as usize];
+        let mut canvas = blank();
         let mut cava = Cava::new();
-        cava.render(&mut canvas, 200, H, W * 4);
-        assert!(cava.width() > 0, "the visualiser claimed a zero-width box");
+        cava.render(&palette(), &mut canvas, 200, H, W * 4);
         assert!(ink(&canvas) > 100, "the visualiser drew almost nothing");
-        assert_boxed_in(&canvas, 200, cava.width());
 
         // The box is sized as `2 * BORDER + 2 * H_PAD + text_width(...)`, so with
         // the frame still all zeros every bar is the lowest block element. This
@@ -622,12 +572,48 @@ mod module_rendering {
         // against it here would only prove it agrees with itself.
         let font = font().unwrap();
         let bars = "\u{2581}".repeat(14);
-        let expected =
+        let box_w =
             2 + 2 * 8 + text_width(font, Scale::uniform(H as f32 * 0.5), &bars).ceil() as u32;
-        assert_eq!(
-            cava.width(),
-            expected,
-            "the visualiser's box is not sized from the shared text_width"
-        );
+        assert_boxed_in(&canvas, 200, box_w);
+    }
+
+    /// The palette used to be a process global, so a module could have kept
+    /// reading it instead of the one it was handed and every test would still
+    /// pass. Rendering the same module with two palettes must therefore produce
+    /// two different frames; a module that ignored the argument draws the same
+    /// bytes twice.
+    #[test]
+    fn the_palette_reaches_the_pixels() {
+        if font().is_none() {
+            return;
+        }
+        let loud = Colors {
+            accent: Color::rgb(0xff, 0x00, 0x00),
+            background: Color::rgb(0x00, 0x00, 0xff),
+            ..Colors::default()
+        };
+        let quiet = Colors {
+            accent: Color::rgb(0x12, 0x34, 0x56),
+            background: Color::rgb(0x00, 0x00, 0x00),
+            ..Colors::default()
+        };
+
+        let mut loud_clock = blank();
+        Clock::new().render(&loud, &mut loud_clock, 400, 800, H, W * 4);
+        let mut quiet_clock = blank();
+        Clock::new().render(&quiet, &mut quiet_clock, 400, 800, H, W * 4);
+        assert_ne!(loud_clock, quiet_clock, "the clock ignored the palette");
+
+        let mut loud_ws = blank();
+        WorkspaceList::new().render(&loud, &mut loud_ws, 0, H, W * 4);
+        let mut quiet_ws = blank();
+        WorkspaceList::new().render(&quiet, &mut quiet_ws, 0, H, W * 4);
+        assert_ne!(loud_ws, quiet_ws, "the workspaces ignored the palette");
+
+        let mut loud_cava = blank();
+        Cava::new().render(&loud, &mut loud_cava, 200, H, W * 4);
+        let mut quiet_cava = blank();
+        Cava::new().render(&quiet, &mut quiet_cava, 200, H, W * 4);
+        assert_ne!(loud_cava, quiet_cava, "the visualiser ignored the palette");
     }
 }

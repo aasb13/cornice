@@ -143,7 +143,7 @@ impl rwconfig::Config for Config {
 /// The whole palette. These were previously constants in `theme.rs`, kept in
 /// sync by hand with a waybar stylesheet; the defaults here are those exact
 /// values.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Colors {
     /// Text, borders, active states.
@@ -323,10 +323,14 @@ mod tests {
         assert_eq!(config.reload.interval().as_secs(), 60);
     }
 
-    /// A palette swap must be visible to the draw sites, which is the whole
-    /// point of reloading: `theme::colors()` is what every module reads.
+    /// A reload has to be visible to the draw sites, which is the whole point of
+    /// watching the file. The palette used to be a process global that
+    /// `theme::init` overwrote, and this test existed to prove the swap reached
+    /// it; with the palette handed to each draw instead, what has to hold is that
+    /// a module renders differently for two different palettes — that is
+    /// `the_palette_reaches_the_pixels` in `theme`.
     #[test]
-    fn a_reload_replaces_the_live_palette() {
+    fn a_reload_produces_a_different_palette() {
         let red = Config {
             colors: Colors {
                 accent: Color::rgb(255, 64, 64),
@@ -334,12 +338,11 @@ mod tests {
             },
             ..Config::default()
         };
-        crate::theme::init(&red);
-        assert_eq!(crate::theme::accent(), Color::rgb(255, 64, 64));
-
-        // And back again, proving it's a swap rather than a set-once.
-        crate::theme::init(&Config::default());
-        assert_eq!(crate::theme::accent(), Color::rgb(191, 255, 217));
+        assert_eq!(red.colors.accent, Color::rgb(255, 64, 64));
+        assert_ne!(red.colors, Config::default().colors);
+        // And a reload is a swap, not an accumulate: the untouched channels keep
+        // the defaults rather than blending with whatever was there before.
+        assert_eq!(red.colors.background, Colors::default().background);
     }
 
     #[test]

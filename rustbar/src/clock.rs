@@ -1,6 +1,7 @@
 use rusttype::Scale;
 
-use crate::theme::{self, accent, bg, draw_bordered_box, draw_text, text_width};
+use crate::config::Colors;
+use crate::theme::{self, draw_bordered_box, draw_text, text_width};
 
 pub struct Clock;
 
@@ -9,7 +10,15 @@ impl Clock {
         Clock
     }
 
-    pub fn render(&mut self, canvas: &mut [u8], left: u32, right: u32, height: u32, stride: u32) {
+    pub fn render(
+        &mut self,
+        colors: &Colors,
+        canvas: &mut [u8],
+        left: u32,
+        right: u32,
+        height: u32,
+        stride: u32,
+    ) {
         let Some(font) = theme::font() else {
             return;
         };
@@ -28,7 +37,16 @@ impl Clock {
         let box_x = left + usable_w.saturating_sub(box_w) / 2;
 
         // waybar `#clock` box: black bg + 1px accent border.
-        draw_bordered_box(canvas, stride, box_x, 0, box_w, height, bg(), accent());
+        draw_bordered_box(
+            canvas,
+            stride,
+            box_x,
+            0,
+            box_w,
+            height,
+            colors.background,
+            colors.accent,
+        );
 
         // text: 14px in from the box's left border, vertically centered
         let x = box_x as f32 + BORDER as f32 + H_PAD as f32;
@@ -42,7 +60,7 @@ impl Clock {
             &text,
             x,
             y,
-            accent(),
+            colors.accent,
         );
     }
 }

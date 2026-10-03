@@ -1,4 +1,5 @@
-use crate::theme::{accent, bg, draw_bordered_box};
+use crate::config::Colors;
+use crate::theme::draw_bordered_box;
 use crate::tray::{MenuItem, TrayCommand, TrayIcons};
 
 pub struct TrayRenderer {
@@ -20,7 +21,14 @@ impl TrayRenderer {
     /// Renders the tray as a waybar `#tray` box (black bg, 1px accent border,
     /// 14px h-padding) right-aligned ending at `right_edge`. Returns total
     /// width consumed (0 if there are no icons).
-    pub fn render(&mut self, canvas: &mut [u8], right_edge: u32, height: u32, stride: u32) -> u32 {
+    pub fn render(
+        &mut self,
+        colors: &Colors,
+        canvas: &mut [u8],
+        right_edge: u32,
+        height: u32,
+        stride: u32,
+    ) -> u32 {
         self.layout.clear();
         let icons = self.icons.lock().unwrap().clone();
         // Size icons to the bar's font scale (matches the widget strip's
@@ -42,7 +50,16 @@ impl TrayRenderer {
         let box_w = 2 * border + 2 * h_pad + content_w;
         let box_x = right_edge.saturating_sub(box_w);
 
-        draw_bordered_box(canvas, stride, box_x, 0, box_w, height, bg(), accent());
+        draw_bordered_box(
+            canvas,
+            stride,
+            box_x,
+            0,
+            box_w,
+            height,
+            colors.background,
+            colors.accent,
+        );
 
         // Icons left-to-right inside the box, each centered in its slot.
         let mut x = box_x + border + h_pad;

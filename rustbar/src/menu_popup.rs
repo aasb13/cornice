@@ -22,7 +22,8 @@ use wayland_client::{
 };
 use wayland_protocols::xdg::shell::client::xdg_positioner::{Anchor, Gravity};
 
-use crate::theme::{self, accent, bg, bg_hover, draw_text, text_width};
+use crate::config::Colors;
+use crate::theme::{self, draw_text, text_width};
 use crate::tray::MenuItem;
 use crate::wayland_backend::App;
 
@@ -156,7 +157,7 @@ impl MenuPopup {
     }
 
     /// Paint the menu contents into its own surface's buffer.
-    pub fn draw(&mut self) {
+    pub fn draw(&mut self, colors: Colors) {
         let (buffer, canvas) = match self.pool.create_buffer(
             self.width as i32,
             self.height as i32,
@@ -174,9 +175,9 @@ impl MenuPopup {
         for (row, item) in self.items.iter().enumerate() {
             let y0 = row as u32 * ROW_HEIGHT;
             let row_bg = if Some(row) == self.hovered {
-                bg_hover()
+                colors.background_hover
             } else {
-                bg()
+                colors.background
             }
             .to_bgra(255);
             for y in y0..y0 + ROW_HEIGHT {
@@ -204,7 +205,7 @@ impl MenuPopup {
                     &item.label,
                     pen_x,
                     pen_y,
-                    accent(),
+                    colors.accent,
                 );
             }
         }

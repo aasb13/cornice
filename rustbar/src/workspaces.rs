@@ -1,8 +1,7 @@
 use rusttype::Scale;
 
-use crate::theme::{
-    self, accent, bg, draw_bordered_box, draw_text, fill_rect, inactive, on_accent, text_width,
-};
+use crate::config::Colors;
+use crate::theme::{self, draw_bordered_box, draw_text, fill_rect, text_width};
 
 const NUM_SLOTS: i32 = 10;
 /// Button width — waybar `#workspaces button { min-width: 22px }`.
@@ -63,13 +62,14 @@ impl WorkspaceList {
         2 * BORDER + NUM_SLOTS as u32 * BOX_WIDTH
     }
 
-    /// How many buttons the last render laid out — one per slot, unless there was
-    /// no font to draw the numbers with.
-    pub fn button_count(&self) -> usize {
-        self.layout.len()
-    }
-
-    pub fn render(&mut self, canvas: &mut [u8], x_offset: u32, height: u32, stride: u32) {
+    pub fn render(
+        &mut self,
+        colors: &Colors,
+        canvas: &mut [u8],
+        x_offset: u32,
+        height: u32,
+        stride: u32,
+    ) {
         self.layout.clear();
         let Some(font) = theme::font() else {
             return;
@@ -87,8 +87,8 @@ impl WorkspaceList {
             0,
             container_w,
             height,
-            bg(),
-            accent(),
+            colors.background,
+            colors.accent,
         );
 
         let bar_width = stride / 4;
@@ -108,7 +108,7 @@ impl WorkspaceList {
 
             // active → accent background (waybar `.active { background: accent }`)
             if is_active {
-                fill_rect(canvas, stride, bx, by, bw, bh, accent(), 255);
+                fill_rect(canvas, stride, bx, by, bw, bh, colors.accent, 255);
             }
 
             // Text color, matching waybar's button/empty/active/hover rules:
@@ -117,11 +117,11 @@ impl WorkspaceList {
             //   empty + hover      → accent (`:hover { color: accent }`)
             //   empty              → `inactive` (`.empty { color: #222 }`)
             let text_color = if is_active {
-                on_accent()
+                colors.on_accent
             } else if self.state.existing.contains(&slot) || self.hovered == Some(slot) {
-                accent()
+                colors.accent
             } else {
-                inactive()
+                colors.inactive
             };
 
             let text = slot.to_string();

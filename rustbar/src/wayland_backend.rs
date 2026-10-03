@@ -363,7 +363,7 @@ impl App {
     /// the screen.
     fn check_reload(&mut self) {
         if self.reload.poll().is_some() {
-            self.apply_config("config file changed");
+            log::info!("config reloaded from disk");
         }
     }
 
@@ -372,19 +372,8 @@ impl App {
     /// whether or not the file looks changed.
     fn force_reload(&mut self) {
         if self.reload.force().is_some() {
-            self.apply_config("SIGHUP");
+            log::info!("config reloaded from SIGHUP");
         }
-    }
-
-    /// Adopt the config `Reload` just installed.
-    ///
-    /// `Reload` has already read, validated and swapped it in, so there is no
-    /// second copy of the palette to keep in step: the draw sites read the
-    /// global theme, which is refreshed from this one value.
-    fn apply_config(&mut self, reason: &str) {
-        log::info!("applying config ({reason})");
-        crate::theme::init(self.reload.config());
-        log::info!("config reloaded");
     }
 
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
@@ -419,7 +408,14 @@ impl App {
             pixel[3] = 0; // fully transparent — argb8888 is premultiplied, so 0 alpha means 0 everywhere
         }
 
+        // One palette for the whole frame, read once. Handing the same borrow to every
+        // module is what makes a reload take effect everywhere at the next redraw
+        // instead of each module holding a copy that has to be refreshed
+        // separately.
+        let colors = &self.reload.config().colors;
+
         self.clock.render(
+            colors,
             canvas,
             SIDE_MARGIN,
             width - SIDE_MARGIN,
@@ -427,21 +423,22 @@ impl App {
             stride as u32,
         );
         self.workspaces
-            .render(canvas, SIDE_MARGIN, height, stride as u32);
+            .render(colors, canvas, SIDE_MARGIN, height, stride as u32);
         // cava: waybar `modules-left = [hyprland/workspaces, cava]` — sits right
         // after workspaces with the waybar 6px gap (`#workspaces { margin: 0
         // 6px 0 0 }` right margin) between them.
         let cava_x = SIDE_MARGIN + self.workspaces.width() + 6;
-        self.cava.render(canvas, cava_x, height, stride as u32);
+        self.cava
+            .render(colors, canvas, cava_x, height, stride as u32);
         // Right side: the seamless widget strip is rightmost (battery right
         // cap at the inset edge); the tray is rendered to its LEFT with the
         // waybar 14px gap between them.
-        let widgets_w = self
-            .widgets
-            .render(canvas, width - SIDE_MARGIN, height, stride as u32);
+        let widgets_w =
+            self.widgets
+                .render(colors, canvas, width - SIDE_MARGIN, height, stride as u32);
         let tray_right = width - SIDE_MARGIN - widgets_w - if widgets_w > 0 { 14 } else { 0 };
         if let Some(tray) = &mut self.tray {
-            tray.render(canvas, tray_right, height, stride as u32);
+            tray.render(colors, canvas, tray_right, height, stride as u32);
         }
 
         layer
@@ -585,7 +582,10 @@ impl LayerShellHandler for App {
         } else if self.menu.as_ref().map(|m| m.wl_surface()) == Some(surface) {
             // tray menu popup — now an xdg_popup, not a layer surface, so this
             // branch shouldn't fire for it; left as a no-op safety net.
-            let _ = self.menu.as_mut().map(|m| m.draw());
+            let _ = self
+                .menu
+                .as_mut()
+                .map(|m| m.draw(self.reload.config().colors));
         }
     }
 }
@@ -602,7 +602,7 @@ impl PopupHandler for App {
         // MenuPopup::create). We match by the popup's wl_surface, but since
         // only one menu is open at a time we can just repaint it directly.
         if let Some(menu) = &mut self.menu {
-            menu.draw();
+            menu.draw(self.reload.config().colors);
         }
     }
 
@@ -681,7 +681,7 @@ impl PointerHandler for App {
                         let (_x, y) = event.position;
                         if let Some(menu) = &mut self.menu {
                             menu.set_hover(y);
-                            menu.draw();
+                            menu.draw(self.reload.config().colors);
                         }
                         if let Some(tp) = &self.themed_pointer {
                             let _ = tp.set_cursor(conn, CursorIcon::Pointer);

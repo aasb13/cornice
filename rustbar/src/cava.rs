@@ -37,7 +37,8 @@ use std::thread;
 use calloop::channel::Sender;
 use rusttype::Scale;
 
-use crate::theme::{self, accent, bg, draw_bordered_box, draw_text, text_width};
+use crate::config::Colors;
+use crate::theme::{self, draw_bordered_box, draw_text, text_width};
 
 /// Number of bars (waybar `cava` `bars: 14`).
 const BARS: usize = 14;
@@ -151,7 +152,14 @@ impl Cava {
 
     /// Render the `#cava` box (background fill + 1px accent border, 8px
     /// h-padding) containing the latest frame's block glyphs, accent-colored.
-    pub fn render(&mut self, canvas: &mut [u8], x_offset: u32, height: u32, stride: u32) {
+    pub fn render(
+        &mut self,
+        colors: &Colors,
+        canvas: &mut [u8],
+        x_offset: u32,
+        height: u32,
+        stride: u32,
+    ) {
         let Some(font) = theme::font() else {
             return;
         };
@@ -173,7 +181,16 @@ impl Cava {
 
         // Same filled-box primitive as the clock/workspaces/tray/widgets modules,
         // so cava matches the rest of the bar instead of being the one hole.
-        draw_bordered_box(canvas, stride, x_offset, 0, box_w, height, bg(), accent());
+        draw_bordered_box(
+            canvas,
+            stride,
+            x_offset,
+            0,
+            box_w,
+            height,
+            colors.background,
+            colors.accent,
+        );
 
         // Pen: 1px in from the border, 8px h-padding, vertically centered. The
         // block glyphs sit at the bottom of their cell, so bars grow upward from
@@ -187,14 +204,8 @@ impl Cava {
             &glyphs,
             x_offset as f32 + BORDER as f32 + H_PAD as f32,
             (height as f32 - glyph_height) / 2.0 + v_metrics.ascent,
-            accent(),
+            colors.accent,
         );
-    }
-
-    /// Total pixel width this module occupies on the left of the bar, as laid out
-    /// by the last render.
-    pub fn width(&self) -> u32 {
-        self.layout.1.saturating_sub(self.layout.0)
     }
 
     /// Whether the given bar-local x falls inside the last-rendered cava box.
