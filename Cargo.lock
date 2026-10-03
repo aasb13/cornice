@@ -1135,7 +1135,6 @@ dependencies = [
  "calloop-wayland-source",
  "chrono",
  "clap",
- "dirs",
  "env_logger",
  "hyprland",
  "image",
@@ -1198,7 +1197,6 @@ dependencies = [
  "calloop",
  "calloop-wayland-source",
  "clap",
- "dirs",
  "env_logger",
  "log",
  "nix",
@@ -1215,6 +1213,8 @@ name = "rwconfig"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
+ "log",
  "nix",
  "serde",
  "toml",

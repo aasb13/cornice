@@ -1,16 +1,22 @@
 //! Configuration for rustbar.
 //!
-//! Config lives at `~/.config/rustbar/config.toml`, or wherever `--config`
-//! points. If the file doesn't exist it is created on first run as a fully
+//! The file lives at `~/.config/rustbar/config.toml`, or wherever `--config`
+//! points. If it doesn't exist it is created on first run as a fully
 //! commented-out dump of every option, so the file is always a complete,
 //! self-documenting template for the version of rustbar that wrote it.
 //!
 //! Unknown keys are a hard error rather than a silent no-op: a typo in a config
 //! that quietly does nothing is worse than a config that refuses to start.
+//!
+//! What happens *around* the file — finding it, creating it, watching it,
+//! re-reading it, surviving a bad edit — is [`rwconfig`]'s job, not this
+//! module's. What's here is what's specific to rustbar: the palette, and how
+//! it is parsed.
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+
+pub use rwconfig::ReloadConfig;
 
 /// An 8-bit RGB colour.
 ///
@@ -119,51 +125,18 @@ pub struct Config {
     pub reload: ReloadConfig,
 }
 
-/// Live config reloading, so tweaking a colour doesn't mean restarting.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReloadConfig {
-    /// Re-read the config when the file changes on disk. `rustbar --reload`
-    /// reloads regardless of this setting.
-    #[serde(default = "default_true")]
-    pub watch: bool,
-
-    /// How often to check the config file for changes, in milliseconds. Only the
-    /// file's mtime and size are compared per tick; it is re-parsed when one of
-    /// them actually moved.
-    #[serde(default = "default_reload_interval_ms")]
-    pub interval_ms: u64,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_reload_interval_ms() -> u64 {
-    500
-}
-
-impl Default for ReloadConfig {
-    fn default() -> Self {
-        ReloadConfig {
-            watch: true,
-            interval_ms: 500,
-        }
-    }
-}
-
-impl ReloadConfig {
-    /// Clamped to a range that is neither "re-parse every frame" nor "effectively
-    /// never".
-    pub fn interval(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.interval_ms.clamp(50, 60_000))
+impl rwconfig::Config for Config {
+    /// The palette is validated by parsing — a colour either is a hex string or
+    /// fails at deserialization — so the only thing left to check is the reload
+    /// table. Declared explicitly rather than left to the default so that a
+    /// future option has somewhere obvious to be checked, and so both binaries
+    /// answer this question the same way.
+    fn validate(&self) -> Result<()> {
+        self.reload.validate()
     }
 
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if self.interval_ms == 0 {
-            anyhow::bail!("reload.interval_ms must be greater than 0");
-        }
-        Ok(())
+    fn reload(&self) -> &ReloadConfig {
+        &self.reload
     }
 }
 
@@ -223,43 +196,7 @@ impl Default for Colors {
     }
 }
 
-impl Config {
-    /// Absolute path of the config file, or the one `--config` named.
-    pub fn path(explicit: Option<&Path>) -> Result<PathBuf> {
-        if let Some(p) = explicit {
-            return Ok(p.to_path_buf());
-        }
-        let dir = dirs::config_dir().context("could not determine config directory")?;
-        Ok(dir.join("rustbar").join("config.toml"))
-    }
-
-    /// Load and validate the config, creating a commented template if there
-    /// isn't one yet.
-    pub fn load(explicit: Option<&Path>) -> Result<Self> {
-        let path = Self::path(explicit)?;
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                let config: Config = toml::from_str(&contents)
-                    .with_context(|| format!("failed to parse config file {}", path.display()))?;
-                config.reload.validate()?;
-                log::info!("loaded config from {}", path.display());
-                Ok(config)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                log::info!("no config found at {}, creating default", path.display());
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).context("failed to create config directory")?;
-                }
-                std::fs::write(&path, default_config_text())
-                    .context("failed to write default config file")?;
-                Ok(Config::default())
-            }
-            Err(e) => bail!("failed to read config file {}: {e}", path.display()),
-        }
-    }
-}
-
-const CONFIG_HEADER: &str = "\
+pub const CONFIG_HEADER: &str = "\
 # Rustbar configuration
 #
 # Every option is shown with its default value, commented out: uncomment a line
@@ -267,26 +204,10 @@ const CONFIG_HEADER: &str = "\
 # loudly instead of being silently ignored.
 ";
 
-/// A ready-to-write config file: the header, then every option dumped from the
-/// `Default` impls and commented out.
-///
-/// Generating it from `Default` rather than hand-writing it means the template
-/// cannot drift out of sync with the code — a new option shows up here the
-/// moment someone adds it, and a renamed one stops being advertised at the same
-/// moment.
+/// The commented template a missing config file is created from, and what
+/// `--print-default-config` prints.
 pub fn default_config_text() -> String {
-    let dumped = toml::to_string_pretty(&Config::default()).expect("Default must serialize");
-    let mut out = String::from(CONFIG_HEADER);
-    for line in dumped.lines() {
-        if line.trim().is_empty() {
-            out.push('\n');
-        } else {
-            out.push_str("# ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
+    rwconfig::commented_template::<Config>(CONFIG_HEADER)
 }
 
 #[cfg(test)]

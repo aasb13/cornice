@@ -67,20 +67,25 @@ fn main() -> Result<()> {
     // the process.
     rwconfig::block_early()?;
 
-    let config = config::Config::load(args.config.as_deref())?;
+    // Opens the config, creating a commented template on first run. A config
+    // that doesn't parse is fatal here — there is no previous one to fall back
+    // to — whereas a bad edit later is logged and ignored.
+    let reload = rwconfig::Reload::<config::Config>::open(
+        "rustbar",
+        config::CONFIG_HEADER,
+        args.config.as_deref(),
+    )?;
 
     if args.print_config {
-        print!("{}", toml::to_string_pretty(&config)?);
+        print!("{}", toml::to_string_pretty(reload.config())?);
         return Ok(());
     }
 
-    theme::init(&config);
-    let config_path = config::Config::path(args.config.as_deref())?;
+    theme::init(reload.config());
     wayland_backend::run(
         args.monitor,
         args.height,
         Box::new(clock::Clock::new()),
-        &config_path,
-        &config,
+        reload,
     )
 }

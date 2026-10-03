@@ -1,19 +1,21 @@
-//! Config reloading shared by `rustwall` and `rustbar`.
+//! Config loading and reloading shared by `rustwall` and `rustbar`.
 //!
-//! Both binaries want the same two behaviours, and both get them wrong in the
-//! same ways if written twice:
+//! Both binaries want the same behaviour from a TOML file in their XDG config
+//! directory, and both get it wrong in the same ways if written twice: the
+//! config file is created on first run as a commented template, re-read when it
+//! changes, and forced by `SIGHUP`.
 //!
-//! * **Automatic** — watch the config file and re-read it when it changes, on an
-//!   interval (see each binary's `[reload]` table). Cheaper and more reliable
-//!   than an inotify subscription: it survives the file being replaced by a
-//!   rename, which is what most editors do on save.
-//! * **Manual** — catch `SIGHUP` so `rustbar --reload` (or `kill -HUP`) forces a
-//!   re-read regardless of whether the watcher is enabled.
-//!
-//! The important property both paths share: **a broken config never takes the
+//! The important property every path shares: **a broken config never takes the
 //! running process down.** A typo while editing would otherwise kill your
 //! wallpaper or bar and leave you with nothing on screen. Instead the error is
 //! logged and the last good config stays in effect.
+//!
+//! [`Reload`] is the entry point; [`Watcher`] and the `SIGHUP` helpers below
+//! are the pieces it is built from, exposed for callers that need to drive the
+//! polling themselves.
+
+mod reload;
+pub use reload::{Config, Reload, ReloadConfig, commented_template};
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -37,9 +39,12 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Start watching `path`. The first [`Watcher::changed`] call always reports
-    /// a change if the file exists, so the caller's initial load and the first
-    /// tick agree on what's "current".
+    /// Start watching `path`, treating its current state as already-seen.
+    ///
+    /// Snapshotting here rather than reporting a spurious first change is what
+    /// lets a caller's initial load and the first tick agree on what "current"
+    /// means: a freshly-opened watcher is quiet, and the first `changed()` it
+    /// returns `true` is a real edit made after it was opened.
     pub fn new(path: PathBuf, interval: Duration) -> Self {
         let (mtime, size) = stat_of(&path);
         Watcher {
@@ -99,13 +104,6 @@ impl Watcher {
         self.interval = interval;
         self.next_poll = None;
     }
-
-    /// Clear the interval gate so the next [`Watcher::changed`] call checks
-    /// immediately. This is what lets a manual `SIGHUP` reload take effect now
-    /// rather than up to one interval later.
-    pub fn poke(&mut self) {
-        self.next_poll = None;
-    }
 }
 
 fn stat_of(path: &Path) -> (Option<SystemTime>, Option<u64>) {
@@ -113,16 +111,6 @@ fn stat_of(path: &Path) -> (Option<SystemTime>, Option<u64>) {
         Ok(m) => (m.modified().ok(), Some(m.len())),
         Err(_) => (None, None),
     }
-}
-
-/// Whether a change needs a full re-parse, given the file's current text.
-///
-/// Some editors save by truncating and rewriting, so a read can land between the
-/// two and see a partial file. If what we read doesn't parse, this returns
-/// `false` so the caller can skip it and try again on the next tick rather than
-/// logging an error for a file that is perfectly valid a few milliseconds later.
-pub fn looks_complete<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, toml::de::Error> {
-    toml::from_str(text)
 }
 
 #[cfg(unix)]
@@ -194,30 +182,10 @@ mod sighup {
 #[cfg(unix)]
 pub use sighup::{block_early, signal_siblings};
 
-/// Build the commented config template both binaries write on first run.
-///
-/// Generated from the caller's `Default` impl rather than hand-written, so the
-/// template cannot drift out of sync with the code — a new option appears here
-/// the moment someone adds it, and a renamed one stops being advertised at the
-/// same moment.
-pub fn commented_template<T: serde::Serialize + Default>(header: &str) -> String {
-    let dumped = toml::to_string_pretty(&T::default()).expect("Default must serialize");
-    let mut out = String::from(header);
-    for line in dumped.lines() {
-        if line.trim().is_empty() {
-            out.push('\n');
-        } else {
-            out.push_str("# ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("rwconfig-test-{}-{name}", std::process::id()));
@@ -255,10 +223,10 @@ mod tests {
     }
 
     /// `interval` gates polling so a burst of writes doesn't cause a re-parse
-    /// per write — but a `SIGHUP` must be able to bypass the gate, since that's
-    /// the whole point of it being a manual override.
+    /// per write. A `SIGHUP` needs no bypass on the watcher: it reads the file
+    /// directly, through `Reload::force`.
     #[test]
-    fn the_interval_gates_polling_but_poke_bypasses_it() {
+    fn the_interval_gates_polling() {
         let dir = tmp("gate");
         let path = dir.join("config.toml");
         std::fs::write(&path, "a = 1").unwrap();
@@ -273,10 +241,6 @@ mod tests {
 
         std::fs::write(&path, "a = 2").unwrap();
         assert!(!w.changed(), "still gated");
-
-        w.poke();
-        assert!(w.due());
-        assert!(w.changed(), "poke must force the next check through");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -330,7 +294,7 @@ mod tests {
     /// "uncomment everything" silently produces a different config.
     #[test]
     fn template_is_valid_and_round_trips() {
-        let text = commented_template::<Sample>("# header\n");
+        let text = reload::commented_template::<Sample>("# header\n");
         assert_eq!(toml::from_str::<Sample>(&text).unwrap(), Sample::default());
 
         let live: String = text
@@ -381,7 +345,10 @@ mod tests {
         assert_eq!(child_pid, child.id());
         assert_ne!(child_pid, std::process::id(), "must not signal itself");
 
-        assert!(signal_siblings().unwrap() >= 1, "sibling was not found to signal");
+        assert!(
+            signal_siblings().unwrap() >= 1,
+            "sibling was not found to signal"
+        );
 
         // SIGHUP's default action terminates, so a delivered signal shows up as
         // the child dying on its own rather than having to be killed.

@@ -22,7 +22,9 @@
 //!   * A wall's per-slot colour and brightness are precomputed when it spawns,
 //!     so the draw path is a lookup rather than a lerp and a `powi` per glyph.
 
-use crate::config::{Color, Config, Cube3dConfig, PowerSaveConfig, FONT_PATHS, WATERFALL_FONT_PATH};
+use crate::config::{
+    Color, Config, Cube3dConfig, FONT_PATHS, PowerSaveConfig, WATERFALL_FONT_PATH,
+};
 use crate::source::FrameSource;
 use rusttype::{Font, Scale, point};
 use std::collections::HashMap;

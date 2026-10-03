@@ -622,6 +622,9 @@ fn default_flash_brightness() -> f32 {
 mod tests {
     use super::*;
     use crate::config::Config;
+    // Anonymous import: brings `validate` into scope without colliding with the
+    // `Config` struct of the same name.
+    use rwconfig::Config as _;
 
     fn parse(toml_text: &str) -> Config {
         toml::from_str::<Config>(toml_text).unwrap()

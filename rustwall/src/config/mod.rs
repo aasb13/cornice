@@ -1,24 +1,29 @@
 //! Configuration for rustwall.
 //!
-//! Config lives at `~/.config/rustwall/config.toml` by default (the XDG
-//! config directory on Linux), or wherever `--config` points. If the file
-//! doesn't exist it is created on first run as a fully commented-out dump of
-//! every option, so the file is always a complete, self-documenting template
-//! for the version of rustwall that wrote it.
+//! The file lives at `~/.config/rustwall/config.toml` by default (the XDG
+//! config directory on Linux), or wherever `--config` points. If it doesn't
+//! exist it is created on first run as a fully commented-out dump of every
+//! option, so the file is always a complete, self-documenting template for the
+//! version of rustwall that wrote it.
 //!
 //! Unknown keys are a hard error rather than a silent no-op: a typo in a
 //! config that quietly does nothing is worse than a config that refuses to
 //! start.
+//!
+//! What happens *around* the file — finding it, creating it, watching it,
+//! re-reading it, surviving a bad edit — is [`rwconfig`]'s job, not this
+//! module's. What's here is what's specific to rustwall: the options, and the
+//! rules about which combinations of them can't be rendered.
 
 mod color;
 pub(crate) mod cube3d;
 
 pub use color::Color;
 pub use cube3d::Cube3dConfig;
+pub use rwconfig::ReloadConfig;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 
 /// The built-in font search list used when no explicit `font_path` is
 /// configured. Ordered by preference.
@@ -68,43 +73,6 @@ pub struct Config {
     /// How the config is re-read while running. See [`ReloadConfig`].
     #[serde(default)]
     pub reload: ReloadConfig,
-}
-
-/// Live config reloading, so tweaking a colour doesn't mean restarting.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReloadConfig {
-    /// Re-read the config when the file changes on disk. `SIGHUP` (`kill -HUP`
-    /// or `rustwall --reload`) reloads regardless of this setting.
-    #[serde(default = "default_true")]
-    pub watch: bool,
-
-    /// How often to check the config file for changes, in milliseconds. Polling
-    /// is a single `stat`; the file is only re-parsed when its mtime or size
-    /// actually moved, so this costs nothing in practice.
-    #[serde(default = "default_reload_interval_ms")]
-    pub interval_ms: u64,
-}
-
-fn default_reload_interval_ms() -> u64 {
-    500
-}
-
-impl Default for ReloadConfig {
-    fn default() -> Self {
-        ReloadConfig {
-            watch: default_true(),
-            interval_ms: default_reload_interval_ms(),
-        }
-    }
-}
-
-impl ReloadConfig {
-    /// A zero or absurd interval would mean either re-parsing every frame or
-    /// effectively never reloading, so clamp it to something usable.
-    pub fn interval(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.interval_ms.clamp(50, 60_000))
-    }
 }
 
 /// Behaviour while the machine is running on battery: a laptop (or any box
@@ -183,12 +151,12 @@ impl Default for Config {
     }
 }
 
-impl Config {
+impl rwconfig::Config for Config {
     /// Reject a config that parses but can't be rendered from — an unknown
     /// source, inverted ranges, empty glyph sets. All of these would otherwise
     /// surface as a blank wallpaper or a division by zero, hours later, with no
     /// clue which key caused it.
-    pub fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         if !SOURCES.contains(&self.source.as_str()) {
             bail!(
                 "source = {:?} is not a known source (have: {})",
@@ -197,47 +165,12 @@ impl Config {
             );
         }
         self.cube3d.validate()?;
-        if self.reload.interval_ms == 0 {
-            bail!("reload.interval_ms must be greater than 0");
-        }
+        self.reload.validate()?;
         Ok(())
     }
 
-    /// Absolute path of the config file, or the one `--config` named.
-    pub fn path(explicit: Option<&Path>) -> Result<PathBuf> {
-        if let Some(p) = explicit {
-            return Ok(p.to_path_buf());
-        }
-        let dir = dirs::config_dir().context("could not determine config directory")?;
-        Ok(dir.join("rustwall").join("config.toml"))
-    }
-
-    /// Load and validate the config, creating a commented template if there
-    /// isn't one yet.
-    pub fn load(explicit: Option<&Path>) -> Result<Self> {
-        let path = Self::path(explicit)?;
-
-        let config = match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                let config: Config = toml::from_str(&contents)
-                    .with_context(|| format!("failed to parse config file {}", path.display()))?;
-                log::info!("loaded config from {}", path.display());
-                config
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                log::info!("no config found at {}, creating default", path.display());
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).context("failed to create config directory")?;
-                }
-                std::fs::write(&path, default_config_text())
-                    .context("failed to write default config file")?;
-                Config::default()
-            }
-            Err(e) => anyhow::bail!("failed to read config file {}: {e}", path.display()),
-        };
-
-        config.validate()?;
-        Ok(config)
+    fn reload(&self) -> &ReloadConfig {
+        &self.reload
     }
 }
 
@@ -253,7 +186,7 @@ pub fn ser_float<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error>
     s.serialize_f64((*v as f64 * SCALE).round() / SCALE)
 }
 
-const CONFIG_HEADER: &str = "\
+pub const CONFIG_HEADER: &str = "\
 # Rustwall configuration
 #
 # Every option is shown with its default value, commented out: uncomment a line
@@ -261,31 +194,18 @@ const CONFIG_HEADER: &str = "\
 # loudly instead of being silently ignored.
 ";
 
-/// A ready-to-write config file: the header, then every option dumped from the
-/// `Default` impls and commented out.
-///
-/// Generating it from `Default` rather than hand-writing it means the template
-/// cannot drift out of sync with the code — a new option shows up here the
-/// moment someone adds it, and a renamed one stops being advertised at the same
-/// moment.
+/// The commented template a missing config file is created from, and what
+/// `--print-default-config` prints.
 pub fn default_config_text() -> String {
-    let dumped = toml::to_string_pretty(&Config::default()).expect("Default must always serialize");
-    let mut out = String::from(CONFIG_HEADER);
-    for line in dumped.lines() {
-        if line.trim().is_empty() {
-            out.push('\n');
-        } else {
-            out.push_str("# ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
+    rwconfig::commented_template::<Config>(CONFIG_HEADER)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Anonymous import: brings `validate` into scope without colliding with the
+    // `Config` struct of the same name.
+    use rwconfig::Config as _;
 
     #[test]
     fn empty_config_uses_defaults() {

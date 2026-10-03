@@ -78,10 +78,18 @@ fn main() -> Result<()> {
     // delivering it to a worker and killing the process.
     rwconfig::block_early()?;
 
-    let wp = config::Config::load(args.config.as_deref())?;
+    // Opens the config, creating a commented template on first run. A config
+    // that doesn't parse is fatal here — there is no previous one to fall back
+    // to — whereas a bad edit later is logged and ignored.
+    let reload = rwconfig::Reload::<config::Config>::open(
+        "rustwall",
+        config::CONFIG_HEADER,
+        args.config.as_deref(),
+    )?;
+    let wp = reload.config();
 
     if args.print_config {
-        print!("{}", toml::to_string_pretty(&wp)?);
+        print!("{}", toml::to_string_pretty(wp)?);
         return Ok(());
     }
 
@@ -94,12 +102,5 @@ fn main() -> Result<()> {
         other => bail!("unknown wallpaper source {other:?}"),
     };
 
-    let config_path = config::Config::path(args.config.as_deref())?;
-    wayland_backend::run(
-        args.monitor,
-        active_source,
-        wp.power_save.clone(),
-        &config_path,
-        &wp,
-    )
+    wayland_backend::run(args.monitor, active_source, reload)
 }

@@ -38,29 +38,7 @@ use wayland_client::{
 use crate::config::{Config, PowerSaveConfig};
 use crate::power::PowerMonitor;
 use crate::source::FrameSource;
-
-/// How the running config is kept in sync with the file on disk.
-pub struct Reload {
-    watcher: rwconfig::Watcher,
-    /// Path last successfully loaded from. Kept so a broken edit can be retried
-    /// on the next tick rather than being silently forgotten.
-    path: std::path::PathBuf,
-    watch: bool,
-}
-
-impl Reload {
-    /// Adopt the reload settings from a freshly-loaded config.
-    ///
-    /// Both settings live here rather than being read once at startup: `watch`
-    /// is checked per tick, and the interval has to be pushed into the watcher
-    /// because it gates polling. A new interval is installed even when the
-    /// watcher is switched off, so turning `watch` back on polls at the rate
-    /// the config asks for rather than whatever was set at launch.
-    fn apply(&mut self, cfg: &crate::config::ReloadConfig) {
-        self.watch = cfg.watch;
-        self.watcher.set_interval(cfg.interval());
-    }
-}
+use rwconfig::Reload;
 
 /// Claim `monitor` (or, if `None`, the last output the compositor reports —
 /// matching the original vecpaper's fallback behavior) and start rendering
@@ -69,9 +47,7 @@ impl Reload {
 pub fn run(
     monitor: Option<String>,
     source: Box<dyn FrameSource>,
-    power_save: PowerSaveConfig,
-    config_path: &std::path::Path,
-    config: &Config,
+    reload: Reload<Config>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
     let (globals, mut event_queue) =
@@ -100,13 +76,8 @@ pub fn run(
         buf_w: 0,
         buf_h: 0,
         power: PowerMonitor::new(),
-        power_save,
         on_battery: false,
-        reload: Reload {
-            watcher: rwconfig::Watcher::new(config_path.to_path_buf(), config.reload.interval()),
-            path: config_path.to_path_buf(),
-            watch: config.reload.watch,
-        },
+        reload,
     };
 
     // Two roundtrips, same as the original C main(): the first lets the
@@ -234,7 +205,7 @@ pub fn run(
             calloop::signals::Signals::new(&[calloop::signals::Signal::SIGHUP])
                 .context("failed to create SIGHUP source")?,
             |_, _, app: &mut App| {
-                app.apply_config("SIGHUP");
+                app.force_reload();
             },
         )
         .map_err(|e| anyhow!("failed to insert SIGHUP source: {e}"))?;
@@ -265,15 +236,14 @@ struct App {
     interval: Option<std::time::Duration>,
     /// Battery state, refreshed by a background thread (see [`PowerMonitor`]).
     power: PowerMonitor,
-    /// What to do while on battery, from the config.
-    power_save: PowerSaveConfig,
     /// What the source currently believes about the power state — not the
     /// machine's actual battery state, which is re-read from `power` every
     /// time it matters. Keeping the two apart is what lets a config edit change
     /// the answer without the battery itself having changed.
     on_battery: bool,
-    /// Live config reloading: file watcher plus the manual `SIGHUP` path.
-    reload: Reload,
+    /// The config in force, plus the file watcher and the manual `SIGHUP` path.
+    /// Owns `[power_save]` too, so there is one place a reload writes it.
+    reload: Reload<Config>,
     /// The single SHM buffer we draw into, reused frame after frame. Replacing
     /// this (only on resize) drops the old one and lets the slot pool reclaim
     /// the memory. Keeping one buffer — instead of allocating a new one every
@@ -294,52 +264,56 @@ fn next_power_state(last: bool, power_save: &PowerSaveConfig, discharging: bool)
 }
 
 impl App {
-    /// Re-read the config if it changed on disk, or if a `SIGHUP` asked for it.
-    ///
-    /// A config that fails to parse or validate is logged and ignored: the last
-    /// good one keeps running. That is the whole point of doing this live rather
-    /// than at startup — being mid-edit and saving a half-finished file must not
-    /// blank the wallpaper or kill the process.
+    /// Re-read the config if it changed on disk. `Reload::poll` returns `None`
+    /// both when nothing changed and when the file is broken — the latter is
+    /// logged inside, which is the whole point of doing this live rather than at
+    /// startup: being mid-edit and saving a half-finished file must not blank the
+    /// wallpaper or kill the process.
     fn check_reload(&mut self) {
-        if !self.reload.watch || !self.reload.watcher.changed() {
-            return;
+        if self.reload.poll().is_some() {
+            self.apply_config("config file changed");
         }
-        self.apply_config("config file changed");
     }
 
-    /// Re-read and apply the config. Shared by the file watcher and the
-    /// `SIGHUP` source, which wake the loop independently.
-    ///
-    /// A config that fails to parse or validate is logged and ignored: the last
-    /// good one keeps running. That is the whole point of doing this live rather
-    /// than at startup — being mid-edit and saving a half-finished file must not
-    /// blank the wallpaper or kill the process.
-    fn apply_config(&mut self, reason: &str) {
-        info!("reloading config ({reason})");
-        match Config::load(Some(&self.reload.path)) {
-            Ok(config) => {
-                self.power_save = config.power_save.clone();
-                // The battery state may have changed *meaning*: `enabled` could
-                // have been turned off, or the new cap applied while unplugged.
-                // `check_power` recomputes from the new config and notifies the
-                // source if the effective answer moved. The new cap itself
-                // reaches the source through `reconfigure`, not through here —
-                // `set_power_saving` only carries the on/off half.
-                self.check_power();
-                self.reload.apply(&config.reload);
-                self.source.reconfigure(&config, self.width, self.height);
-                info!("config reloaded");
-            }
-            Err(e) => log::error!("config reload failed, keeping the previous config: {e:#}"),
+    /// Re-read and apply the config, unconditionally. The `SIGHUP` source uses
+    /// this, since it has to work whether or not `[reload] watch` is on and
+    /// whether or not the file looks changed.
+    fn force_reload(&mut self) {
+        if self.reload.force().is_some() {
+            self.apply_config("SIGHUP");
         }
+    }
+
+    /// Adopt the config `Reload` just installed.
+    ///
+    /// `Reload` has already read, validated and swapped it in by this point — the
+    /// power-save table, the reload settings and the source's own settings all
+    /// come out of the same new value, so they cannot disagree about which
+    /// config is in force.
+    fn apply_config(&mut self, reason: &str) {
+        info!("applying config ({reason})");
+        // The battery state may have changed *meaning*: `enabled` could have been
+        // turned off, or the new cap applied while unplugged. `check_power`
+        // recomputes from the new config and notifies the source if the
+        // effective answer moved. The new cap itself reaches the source through
+        // `reconfigure`, not through here — `set_power_saving` only carries the
+        // on/off half.
+        self.check_power();
+        let (w, h) = (self.width, self.height);
+        self.source.reconfigure(self.reload.config(), w, h);
+        info!("config reloaded");
     }
 
     /// Notice a change of power source and tell the source about it.
     /// Unplugging costs a throttled wallpaper; plugging back in must always
     /// restore full speed. Called once per frame, and it costs one atomic load.
     fn check_power(&mut self) {
-        let Some(now) = next_power_state(self.on_battery, &self.power_save, self.power.poll())
-        else {
+        let discharging = self.power.poll();
+        let Some(now) = next_power_state(
+            self.on_battery,
+            &self.reload.config().power_save,
+            discharging,
+        ) else {
             return;
         };
         self.on_battery = now;
@@ -495,7 +469,11 @@ impl LayerShellHandler for App {
             // The first battery reading happens before the first frame, so a
             // wallpaper that boots on battery starts throttled. There is no
             // prior belief to compare against, so the source is told either way.
-            let on_battery = self.power_save.effective_on_battery(self.power.poll());
+            let on_battery = self
+                .reload
+                .config()
+                .power_save
+                .effective_on_battery(self.power.poll());
             self.on_battery = on_battery;
             self.source.set_power_saving(on_battery);
             if on_battery {

@@ -41,6 +41,7 @@ use crate::tray::{self};
 use crate::tray_render::TrayRenderer;
 use crate::widgets::{SegKind, WidgetStrip};
 use crate::workspaces::WorkspaceList;
+use rwconfig::Reload;
 
 /// Volume scroll step in percent. Matches waybar `pulseaudio`'s default
 /// `scroll-step` (the user's config has no override); volume is capped at 100%
@@ -96,8 +97,7 @@ pub fn run(
     monitor: Option<String>,
     bar_height: u32,
     mut clock: Box<Clock>,
-    config_path: &std::path::Path,
-    config: &Config,
+    reload: Reload<Config>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
     let (globals, mut event_queue) =
@@ -151,12 +151,13 @@ pub fn run(
         tray: None,
         menu: None,
         scroll_accum: 0.0,
-        reload: Reload {
-            watcher: rwconfig::Watcher::new(config_path.to_path_buf(), config.reload.interval()),
-            path: config_path.to_path_buf(),
-            watch: config.reload.watch,
-        },
+        reload,
     };
+
+    // The bar's render timer is inserted unconditionally and re-reads its own
+    // interval every tick, so `[reload] interval_ms` takes effect on the next
+    // reload without the source being rebuilt.
+    let reload_interval = app.reload.interval();
 
     event_queue
         .roundtrip(&mut app)
@@ -295,7 +296,7 @@ pub fn run(
         let qh_for_reload = qh.clone();
         loop_handle
             .insert_source(
-                Timer::from_duration(config.reload.interval()),
+                Timer::from_duration(reload_interval),
                 move |_deadline, _, app: &mut App| {
                     // A colour change alone needs no redraw — every draw site
                     // reads the palette fresh — but redrawing costs nothing at
@@ -315,7 +316,7 @@ pub fn run(
             calloop::signals::Signals::new(&[calloop::signals::Signal::SIGHUP])
                 .context("failed to create SIGHUP source")?,
             |_, _, app: &mut App| {
-                app.reload_config("SIGHUP");
+                app.force_reload();
             },
         )
         .map_err(|e| anyhow!("failed to insert SIGHUP source: {e}"))?;
@@ -364,62 +365,41 @@ pub(crate) struct App {
     /// 15px, i.e. you have to flick the touchpad hard. Accumulating here and
     /// consuming whole steps out of the running total fixes that.
     scroll_accum: f64,
-    /// Live config reloading: the file watcher plus where to re-read from.
-    reload: Reload,
-}
-
-/// How the running config is kept in sync with the file on disk.
-pub(crate) struct Reload {
-    watcher: rwconfig::Watcher,
-    path: std::path::PathBuf,
-    watch: bool,
-}
-
-impl Reload {
-    /// Adopt the reload settings from a freshly-loaded config.
-    ///
-    /// The timer that drives this is inserted unconditionally, so whether
-    /// watching happens at all is a per-tick decision rather than a property of
-    /// the event loop's source graph — otherwise turning `watch` on from the
-    /// config file could never take effect, since nothing would be left to
-    /// notice.
-    fn apply(&mut self, cfg: &crate::config::ReloadConfig) {
-        self.watch = cfg.watch;
-        self.watcher.set_interval(cfg.interval());
-    }
-
-    /// The poll interval currently in force. Read per tick rather than captured,
-    /// so editing `interval_ms` in the config takes effect without a restart.
-    fn interval(&self) -> std::time::Duration {
-        self.watcher.interval()
-    }
+    /// Live config reloading: the file watcher plus the manual `SIGHUP` path.
+    /// Owns the config in force, so there is one place a reload writes it.
+    reload: Reload<Config>,
 }
 
 impl App {
-    /// Re-read the config if the file changed on disk, and apply it.
+    /// Re-read the config if the file changed on disk. `Reload::poll` returns
+    /// `None` both when nothing changed and when the file is broken — the latter
+    /// is logged inside, which is the point of reloading live rather than at
+    /// startup: saving a half-finished file mid-edit must not take the bar off
+    /// the screen.
     fn check_reload(&mut self) {
-        if !self.reload.watch || !self.reload.watcher.changed() {
-            return;
+        if self.reload.poll().is_some() {
+            self.apply_config("config file changed");
         }
-        self.reload_config("config file changed");
     }
 
-    /// Re-read and apply the config.
-    ///
-    /// A config that fails to parse or validate is logged and ignored: the last
-    /// good one keeps running. That's the point of reloading live rather than at
-    /// startup — saving a half-finished file mid-edit must not take the bar off
-    /// the screen.
-    fn reload_config(&mut self, reason: &str) {
-        log::info!("reloading config ({reason})");
-        match Config::load(Some(&self.reload.path)) {
-            Ok(config) => {
-                crate::theme::init(&config);
-                self.reload.apply(&config.reload);
-                log::info!("config reloaded");
-            }
-            Err(e) => log::error!("config reload failed, keeping the previous config: {e:#}"),
+    /// Re-read and apply the config, unconditionally. The `SIGHUP` source uses
+    /// this, since it has to work whether or not `[reload] watch` is on and
+    /// whether or not the file looks changed.
+    fn force_reload(&mut self) {
+        if self.reload.force().is_some() {
+            self.apply_config("SIGHUP");
         }
+    }
+
+    /// Adopt the config `Reload` just installed.
+    ///
+    /// `Reload` has already read, validated and swapped it in, so there is no
+    /// second copy of the palette to keep in step: the draw sites read the
+    /// global theme, which is refreshed from this one value.
+    fn apply_config(&mut self, reason: &str) {
+        log::info!("applying config ({reason})");
+        crate::theme::init(self.reload.config());
+        log::info!("config reloaded");
     }
 
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
