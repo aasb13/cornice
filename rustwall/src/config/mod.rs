@@ -11,7 +11,7 @@
 //! start.
 
 mod color;
-mod cube3d;
+pub(crate) mod cube3d;
 
 pub use color::Color;
 pub use cube3d::Cube3dConfig;
@@ -64,6 +64,47 @@ pub struct Config {
     /// settings survive switching `source` back and forth.
     #[serde(default)]
     pub cube3d: Cube3dConfig,
+
+    /// How the config is re-read while running. See [`ReloadConfig`].
+    #[serde(default)]
+    pub reload: ReloadConfig,
+}
+
+/// Live config reloading, so tweaking a colour doesn't mean restarting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReloadConfig {
+    /// Re-read the config when the file changes on disk. `SIGHUP` (`kill -HUP`
+    /// or `rustwall --reload`) reloads regardless of this setting.
+    #[serde(default = "default_true")]
+    pub watch: bool,
+
+    /// How often to check the config file for changes, in milliseconds. Polling
+    /// is a single `stat`; the file is only re-parsed when its mtime or size
+    /// actually moved, so this costs nothing in practice.
+    #[serde(default = "default_reload_interval_ms")]
+    pub interval_ms: u64,
+}
+
+fn default_reload_interval_ms() -> u64 {
+    500
+}
+
+impl Default for ReloadConfig {
+    fn default() -> Self {
+        ReloadConfig {
+            watch: default_true(),
+            interval_ms: default_reload_interval_ms(),
+        }
+    }
+}
+
+impl ReloadConfig {
+    /// A zero or absurd interval would mean either re-parsing every frame or
+    /// effectively never reloading, so clamp it to something usable.
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.interval_ms.clamp(50, 60_000))
+    }
 }
 
 /// Behaviour while the machine is running on battery: a laptop (or any box
@@ -124,6 +165,7 @@ impl Default for Config {
             fps_cap: 0,
             power_save: PowerSaveConfig::default(),
             cube3d: Cube3dConfig::default(),
+            reload: ReloadConfig::default(),
         }
     }
 }
@@ -142,6 +184,9 @@ impl Config {
             );
         }
         self.cube3d.validate()?;
+        if self.reload.interval_ms == 0 {
+            bail!("reload.interval_ms must be greater than 0");
+        }
         Ok(())
     }
 

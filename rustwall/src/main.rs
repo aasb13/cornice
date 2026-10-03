@@ -16,7 +16,9 @@ use std::path::PathBuf;
 ///
 /// Everything tunable lives in the config file at `~/.config/rustwall/config.toml`
 /// (created on first run as a fully commented template of every option), or
-/// wherever `--config` points.
+/// wherever `--config` points. Changes apply without restarting: the file is
+/// watched automatically (see `[reload]`), or `rustwall --reload` tells the
+/// running instance to re-read now.
 #[derive(Parser, Debug)]
 #[command(name = "rustwall", about = "A minimal Wayland wallpaper platform")]
 struct Args {
@@ -38,6 +40,11 @@ struct Args {
     #[arg(long)]
     print_default_config: bool,
 
+    /// Ask any running rustwall to re-read its config, then exit. Works
+    /// whether or not `[reload] watch` is enabled.
+    #[arg(long)]
+    reload: bool,
+
     /// Enable debug logging.
     #[arg(short, long)]
     debug: bool,
@@ -51,9 +58,25 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Before the logger and before touching the config, because this invocation
+    // only signals another process and exits — it has no wallpaper to draw.
+    if args.reload {
+        let n = rwconfig::signal_siblings()?;
+        if n == 0 {
+            bail!("no running rustwall instance found");
+        }
+        println!("asked {n} running rustwall instance(s) to reload");
+        return Ok(());
+    }
+
     let default_level = if args.debug { "debug" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_level))
         .init();
+
+    // Before anything spawns a thread: every thread must block SIGHUP for the
+    // event loop's signalfd to receive `--reload` rather than the kernel
+    // delivering it to a worker and killing the process.
+    rwconfig::block_early()?;
 
     let wp = config::Config::load(args.config.as_deref())?;
 
@@ -71,5 +94,12 @@ fn main() -> Result<()> {
         other => bail!("unknown wallpaper source {other:?}"),
     };
 
-    wayland_backend::run(args.monitor, active_source, wp.power_save)
+    let config_path = config::Config::path(args.config.as_deref())?;
+    wayland_backend::run(
+        args.monitor,
+        active_source,
+        wp.power_save.clone(),
+        &config_path,
+        &wp,
+    )
 }

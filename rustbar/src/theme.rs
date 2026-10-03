@@ -10,18 +10,29 @@
 //! file, so everything here converts via [`Color::to_bgra`] rather than
 //! unpacking a tuple by hand.
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use crate::config::{Color, Colors, Config};
 
-/// The loaded palette, read once at startup.
-static COLORS: OnceLock<Colors> = OnceLock::new();
+/// The loaded palette.
+///
+/// A `RwLock` rather than a `OnceLock` because the config is re-read live: a
+/// colour edit has to swap the palette while the bar is still running, which a
+/// set-once cell cannot express. Reads are an uncontended atomic load plus a
+/// `Colors` copy (five bytes' worth of `Color`), and there are only a handful of
+/// draws per frame — irrelevant next to rasterizing glyphs.
+static COLORS: RwLock<Option<Colors>> = RwLock::new(None);
 
-/// Install the loaded config. Called once from `main`; a second call is
-/// ignored, which keeps `OnceLock`'s "set once" contract intact without
-/// threading a handle through every module's constructor.
+/// Install or replace the palette. Called at startup, and again on every reload.
 pub fn init(config: &Config) {
-    let _ = COLORS.set(config.colors.clone());
+    let mut slot = match COLORS.write() {
+        Ok(slot) => slot,
+        // A poisoned lock means a draw panicked while holding the read guard. The
+        // stored palette is still a valid value, so recover rather than taking
+        // the whole bar down over it.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = Some(config.colors.clone());
 }
 
 /// The active palette.
@@ -30,10 +41,14 @@ pub fn init(config: &Config) {
 /// If called before [`init`]. Every draw site is reached from
 /// `wayland_backend::run`, which `main` only calls after loading the config, so
 /// this cannot happen in practice.
-pub fn colors() -> &'static Colors {
-    COLORS
-        .get()
+pub fn colors() -> Colors {
+    let slot = match COLORS.read() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.as_ref()
         .expect("theme::init must run before any drawing")
+        .clone()
 }
 
 /// Primary accent — text, borders, active states.

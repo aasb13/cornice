@@ -33,16 +33,39 @@ struct Args {
     /// from, and exit.
     #[arg(long)]
     print_default_config: bool,
+
+    /// Ask any running rustbar to re-read its config, then exit. Works whether
+    /// or not `[reload] watch` is enabled.
+    #[arg(long)]
+    reload: bool,
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
     let args = Args::parse();
 
     if args.print_default_config {
         print!("{}", config::default_config_text());
         return Ok(());
     }
+
+    // Before the logger and before touching the config: this invocation only
+    // signals another process and exits, so it has no bar to draw.
+    if args.reload {
+        let n = rwconfig::signal_siblings()?;
+        if n == 0 {
+            anyhow::bail!("no running rustbar instance found");
+        }
+        println!("asked {n} running rustbar instance(s) to reload");
+        return Ok(());
+    }
+
+    env_logger::init();
+
+    // Before anything spawns a thread: every thread must block SIGHUP for the
+    // event loop's signalfd to receive `--reload` rather than the kernel
+    // delivering it to a worker (the cava reader, the tray client) and killing
+    // the process.
+    rwconfig::block_early()?;
 
     let config = config::Config::load(args.config.as_deref())?;
 
@@ -52,5 +75,12 @@ fn main() -> Result<()> {
     }
 
     theme::init(&config);
-    wayland_backend::run(args.monitor, args.height, Box::new(clock::Clock::new()))
+    let config_path = config::Config::path(args.config.as_deref())?;
+    wayland_backend::run(
+        args.monitor,
+        args.height,
+        Box::new(clock::Clock::new()),
+        &config_path,
+        &config,
+    )
 }

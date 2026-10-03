@@ -31,14 +31,20 @@ pub type TrayIcons = Arc<Mutex<Vec<TrayIcon>>>;
 pub enum TrayCommand {
     Activate(String),
     /// Click a specific item inside a tray icon's context menu.
-    ClickMenuItem { address: String, menu_path: String, item_id: i32 },
+    ClickMenuItem {
+        address: String,
+        menu_path: String,
+        item_id: i32,
+    },
 }
 
 /// Spawns the DBus tray client on its own thread (it needs a tokio runtime;
 /// the rest of the bar runs on calloop) and returns shared storage the
 /// render thread reads from, plus a sender for commands (clicks) back into
 /// the tray thread.
-pub fn spawn(redraw_tx: Sender<()>) -> (TrayIcons, tokio::sync::mpsc::UnboundedSender<TrayCommand>) {
+pub fn spawn(
+    redraw_tx: Sender<()>,
+) -> (TrayIcons, tokio::sync::mpsc::UnboundedSender<TrayCommand>) {
     let icons: TrayIcons = Arc::new(Mutex::new(Vec::new()));
     let icons_bg = icons.clone();
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<TrayCommand>();
@@ -134,7 +140,11 @@ fn sync_icons(client: &Client, icons: &TrayIcons) {
             .and_then(|pixmaps| pixmaps.iter().max_by_key(|p| p.width))
             .map(|pixmap| {
                 (
-                    argb_to_premultiplied_bgra(&pixmap.pixels, pixmap.width as u32, pixmap.height as u32),
+                    argb_to_premultiplied_bgra(
+                        &pixmap.pixels,
+                        pixmap.width as u32,
+                        pixmap.height as u32,
+                    ),
                     pixmap.width as u32,
                     pixmap.height as u32,
                 )
@@ -205,8 +215,17 @@ fn load_icon_by_name(name: &str, app_theme_path: Option<&str>) -> Option<(Vec<u8
 
     // Sizes to try, largest first, so we grab the crispest raster available.
     // "scalable" is checked separately below since SVG needs no size dir.
-    const SIZES: &[&str] = &["512x512", "256x256", "128x128", "64x64", "48x48", "32x32", "24x24", "16x16"];
-    const CATEGORIES: &[&str] = &["status", "apps", "actions", "categories", "devices", "mimetypes"];
+    const SIZES: &[&str] = &[
+        "512x512", "256x256", "128x128", "64x64", "48x48", "32x32", "24x24", "16x16",
+    ];
+    const CATEGORIES: &[&str] = &[
+        "status",
+        "apps",
+        "actions",
+        "categories",
+        "devices",
+        "mimetypes",
+    ];
 
     for root in &search_roots {
         // Root might itself be a flat directory containing "<name>.png"

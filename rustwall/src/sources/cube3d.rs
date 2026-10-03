@@ -22,7 +22,7 @@
 //!   * A wall's per-slot colour and brightness are precomputed when it spawns,
 //!     so the draw path is a lookup rather than a lerp and a `powi` per glyph.
 
-use crate::config::{Color, Cube3dConfig, FONT_PATHS, PowerSaveConfig, WATERFALL_FONT_PATH};
+use crate::config::{Color, Config, Cube3dConfig, PowerSaveConfig, FONT_PATHS, WATERFALL_FONT_PATH};
 use crate::source::FrameSource;
 use rusttype::{Font, Scale, point};
 use std::collections::HashMap;
@@ -277,6 +277,44 @@ impl RotatingTesseract {
     /// The font size the tesseract — and the rain's nominal size — is drawn at.
     fn font_size(&self) -> f32 {
         self.cfg.font_size
+    }
+
+    /// Adopt a new config, rebuilding only what the new values invalidate.
+    ///
+    /// Colours, scale, perspective and rotation speeds are read straight out of
+    /// `self.cfg` every frame, so those are just a swap. Anything that changes
+    /// what gets *rasterized* — the font, its size, the ramp, the rain's glyph
+    /// pool — invalidates the glyph caches and the cell grid, so those re-run
+    /// `init`, the only place that knows how to rebuild them.
+    ///
+    /// Existing rain walls were randomized against the settings that produced
+    /// them, so a change to any of those leaves the survivors inconsistent with
+    /// their own siblings. Respawning is the cheap, correct fix: it re-draws
+    /// every wall in the new shape without touching the tesseract's rotation
+    /// clock, so the animation carries on rather than jumping.
+    fn apply_config(&mut self, wall: &Config) {
+        let old = self.cfg.clone();
+        let needs_rebuild = old.rasterization_key() != wall.cube3d.rasterization_key();
+        self.cfg = wall.cube3d.clone();
+        self.fps_cap = wall.fps_cap;
+        self.power_save = wall.power_save.clone();
+
+        if needs_rebuild {
+            let (w, h) = (self.width, self.height);
+            if w > 0 && h > 0 {
+                self.init(w, h);
+            }
+            return;
+        }
+
+        if !self.cfg.rain.enabled {
+            self.waterfalls.clear();
+        } else if !old.rain.enabled || old.rain.population_key() != self.cfg.rain.population_key() {
+            // The `enabled` check matters on its own: re-enabling the rain after
+            // it was switched off has to respawn the walls that turning it off
+            // cleared, even though none of their parameters changed.
+            self.spawn_waterfalls();
+        }
     }
 
     /// Advance the xorshift64 PRNG.
@@ -1182,6 +1220,10 @@ impl FrameSource for RotatingTesseract {
         self.power_saving = on_battery;
     }
 
+    fn reconfigure(&mut self, config: &crate::config::Config, _width: u32, _height: u32) {
+        self.apply_config(config);
+    }
+
     fn render(&mut self, canvas: &mut [u8], width: u32, height: u32, stride: u32) -> bool {
         // Fill with the configured background. Black is by far the common case and goes
         // through as a single memset-shaped fill; anything else has to be written
@@ -1360,6 +1402,7 @@ impl FrameSource for RotatingTesseract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::cube3d::{F32Range, RainConfig, U32Range};
 
     /// End-to-end check that a configured colour lands in the right channel.
     ///
@@ -1412,7 +1455,10 @@ mod tests {
         );
         // A brightness that would make the glyph invisible packs to 0 so
         // callers can skip the blit.
-        assert_eq!(RotatingTesseract::pack(Color::rgb(0x11, 0x22, 0x33), 0.0), 0);
+        assert_eq!(
+            RotatingTesseract::pack(Color::rgb(0x11, 0x22, 0x33), 0.0),
+            0
+        );
     }
 
     /// The tesseract's cell grid is kept between frames (so it doesn't have to
@@ -1470,6 +1516,155 @@ mod tests {
             "lit cells went {first} -> {again} after returning to the same rotation: \
              the cell grid is not being cleared between frames"
         );
+    }
+
+    /// A live reload has two costs, and only one of them should trigger the
+    /// expensive rebuild. Swapping colours, scale, perspective or rotation speed
+    /// is free — those are read out of the config every frame. Changing anything
+    /// that alters *which glyphs get traced at which size* (font, size, ramp,
+    /// rain pool) invalidates the raster caches, so that re-runs `init`.
+    #[test]
+    fn a_colour_only_reload_does_not_rebuild_the_glyph_caches() {
+        let base = Cube3dConfig::default();
+        let mut recoloured = base.clone();
+        recoloured.tesseract_color = Color::rgb(255, 0, 0);
+        recoloured.scale = 0.3;
+        recoloured.perspective = 9.0;
+        recoloured.rotation.xw = 5.0;
+        assert_eq!(
+            base.rasterization_key(),
+            recoloured.rasterization_key(),
+            "a colour/scale/speed change must not invalidate the raster caches"
+        );
+
+        let mut resized = base.clone();
+        resized.font_size = 12.0;
+        assert_ne!(
+            base.rasterization_key(),
+            resized.rasterization_key(),
+            "a font-size change must invalidate them"
+        );
+
+        let mut reramped = base.clone();
+        reramped.ramp = "#o. ".to_string();
+        assert_ne!(base.rasterization_key(), reramped.rasterization_key());
+
+        let mut reglyphed = base.clone();
+        reglyphed.rain.glyphs = "01".to_string();
+        assert_ne!(base.rasterization_key(), reglyphed.rasterization_key());
+    }
+
+    /// The reload contract: new colours reach the draw path, new rain settings
+    /// take effect, and the animation keeps running rather than restarting.
+    #[test]
+    fn reconfigure_applies_live_without_restarting_the_animation() {
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
+        s.init(1920, 1080);
+        if s.font.is_none() {
+            // No system font in this environment; nothing to render.
+            return;
+        }
+        let phase_before = s.start_time;
+        let walls_before = s.waterfalls.len();
+
+        let mut changed = Config::default();
+        changed.cube3d.tesseract_color = Color::rgb(255, 0, 0);
+        changed.cube3d.rain.wall_count = 7;
+        s.reconfigure(&changed, 1920, 1080);
+
+        assert_eq!(s.cfg.tesseract_color, Color::rgb(255, 0, 0));
+        assert_eq!(
+            s.waterfalls.len(),
+            7,
+            "rain density must apply without a restart"
+        );
+        assert_eq!(s.start_time, phase_before, "the rotation must not jump");
+        assert_ne!(walls_before, 7);
+    }
+
+    /// Turning the rain off must clear the walls, not merely stop drawing them —
+    /// otherwise turning it back on would resurrect a stale population.
+    #[test]
+    fn reconfigure_can_switch_the_rain_off_and_on() {
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
+        s.init(1920, 1080);
+        if s.font.is_none() {
+            return;
+        }
+
+        let mut off = Config::default();
+        off.cube3d.rain.enabled = false;
+        s.reconfigure(&off, 1920, 1080);
+        assert!(s.waterfalls.is_empty());
+
+        s.reconfigure(&Config::default(), 1920, 1080);
+        assert!(!s.waterfalls.is_empty(), "re-enabling must respawn walls");
+    }
+
+    /// Existing walls were randomized against the settings that produced them,
+    /// so a change to any of those has to respawn them — otherwise one screen
+    /// ends up showing walls drawn under two different densities or speeds.
+    #[test]
+    fn a_rain_setting_change_respawns_the_walls() {
+        let base = RainConfig::default();
+        assert_eq!(base.population_key(), base.clone().population_key());
+
+        // Wall count, a range, and a colour each have to count as a change.
+        let mut fewer = base.clone();
+        fewer.wall_count = 10;
+        assert_ne!(base.population_key(), fewer.population_key());
+
+        let mut faster = base.clone();
+        faster.speed = F32Range::new(400.0, 900.0);
+        assert_ne!(base.population_key(), faster.population_key());
+
+        let mut longer = base.clone();
+        longer.length = U32Range::new(3, 5);
+        assert_ne!(base.population_key(), longer.population_key());
+
+        let mut redder = base.clone();
+        redder.color = Color::rgb(255, 0, 0);
+        assert_ne!(base.population_key(), redder.population_key());
+
+        let mut flashier = base.clone();
+        flashier.flash_rate = 0.5;
+        assert_ne!(base.population_key(), flashier.population_key());
+    }
+
+    /// `f32` equality would make these two look identical, so the key compares
+    /// bit patterns and must still see them differ.
+    #[test]
+    fn the_population_key_compares_floats_by_bits() {
+        let mut a = RainConfig::default();
+        a.speed = F32Range::new(-0.0, 1.0);
+        let mut b = RainConfig::default();
+        b.speed = F32Range::new(0.0, 1.0);
+        assert_ne!(
+            a.population_key(),
+            b.population_key(),
+            "-0.0 and 0.0 compare equal as f32 but must not compare equal here"
+        );
+    }
+
+    /// A reload that changes the frame-rate cap must take effect immediately,
+    /// since that is one of the reasons to reload rather than restart.
+    #[test]
+    fn reconfigure_applies_a_new_fps_cap() {
+        let mut s =
+            RotatingTesseract::new(Cube3dConfig::default(), 144, PowerSaveConfig::default());
+        s.init(640, 480);
+        if s.font.is_none() {
+            return;
+        }
+        assert_eq!(
+            s.tick_interval(),
+            Some(Duration::from_secs_f64(1.0 / 144.0))
+        );
+
+        let mut capped = Config::default();
+        capped.fps_cap = 20;
+        s.reconfigure(&capped, 640, 480);
+        assert_eq!(s.tick_interval(), Some(Duration::from_secs_f64(1.0 / 20.0)));
     }
 
     /// A `fps_cap` of 0 means "no cap" (the old ~166Hz pacing, which the

@@ -55,4 +55,17 @@ pub trait FrameSource {
     /// Implementations should return to full speed when handed `false` — this
     /// is a temporary state, not a mode to latch. The default does nothing.
     fn set_power_saving(&mut self, _on_battery: bool) {}
+
+    /// Apply a freshly-loaded config, live, without restarting the process.
+    ///
+    /// Called after the config file changes on disk (or on `SIGHUP`), so a colour
+    /// tweak shows up immediately. The default does nothing, which is correct
+    /// for a source with no configurable state.
+    ///
+    /// `width`/`height` are the surface's current dimensions, so a source that
+    /// has to rebuild caches (rasterized glyphs, geometry) can do it without
+    /// waiting for the next `init`. Implementations must leave the animation
+    /// running where they can — a source that restarts its clock on every
+    /// reload would visibly jump.
+    fn reconfigure(&mut self, _config: &crate::config::Config, _width: u32, _height: u32) {}
 }

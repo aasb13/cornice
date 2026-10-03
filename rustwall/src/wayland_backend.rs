@@ -35,9 +35,18 @@ use wayland_client::{
     protocol::{wl_output, wl_shm, wl_surface},
 };
 
-use crate::config::PowerSaveConfig;
+use crate::config::{Config, PowerSaveConfig};
 use crate::power::PowerMonitor;
 use crate::source::FrameSource;
+
+/// How the running config is kept in sync with the file on disk.
+pub struct Reload {
+    watcher: rwconfig::Watcher,
+    /// Path last successfully loaded from. Kept so a broken edit can be retried
+    /// on the next tick rather than being silently forgotten.
+    path: std::path::PathBuf,
+    watch: bool,
+}
 
 /// Claim `monitor` (or, if `None`, the last output the compositor reports —
 /// matching the original vecpaper's fallback behavior) and start rendering
@@ -47,6 +56,8 @@ pub fn run(
     monitor: Option<String>,
     source: Box<dyn FrameSource>,
     power_save: PowerSaveConfig,
+    config_path: &std::path::Path,
+    config: &Config,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
     let (globals, mut event_queue) =
@@ -77,6 +88,11 @@ pub fn run(
         power: PowerMonitor::new(),
         power_save,
         on_battery: false,
+        reload: Reload {
+            watcher: rwconfig::Watcher::new(config_path.to_path_buf(), config.reload.interval()),
+            path: config_path.to_path_buf(),
+            watch: config.reload.watch,
+        },
     };
 
     // Two roundtrips, same as the original C main(): the first lets the
@@ -194,6 +210,21 @@ pub fn run(
     // version polled sysfs from a timer on *this* thread and a slow ACPI read
     // froze the wallpaper for 50-80ms every few seconds.
 
+    // `--reload` has to wake a loop that is otherwise blocked in `dispatch`
+    // waiting on vsync, which is what the signal source buys: a polled flag
+    // would only be noticed at the next frame, and if the source were ever
+    // static there would be no next frame at all.
+    #[cfg(unix)]
+    loop_handle
+        .insert_source(
+            calloop::signals::Signals::new(&[calloop::signals::Signal::SIGHUP])
+                .context("failed to create SIGHUP source")?,
+            |_, _, app: &mut App| {
+                app.apply_config("SIGHUP");
+            },
+        )
+        .map_err(|e| anyhow!("failed to insert SIGHUP source: {e}"))?;
+
     loop {
         event_loop.dispatch(None, &mut app)?;
         if app.exit {
@@ -225,6 +256,8 @@ struct App {
     /// The state the source was last told about, so we only wake it on a
     /// change.
     on_battery: bool,
+    /// Live config reloading: file watcher plus the manual `SIGHUP` path.
+    reload: Reload,
     /// The single SHM buffer we draw into, reused frame after frame. Replacing
     /// this (only on resize) drops the old one and lets the slot pool reclaim
     /// the memory. Keeping one buffer — instead of allocating a new one every
@@ -235,6 +268,43 @@ struct App {
 }
 
 impl App {
+    /// Re-read the config if it changed on disk, or if a `SIGHUP` asked for it.
+    ///
+    /// A config that fails to parse or validate is logged and ignored: the last
+    /// good one keeps running. That is the whole point of doing this live rather
+    /// than at startup — being mid-edit and saving a half-finished file must not
+    /// blank the wallpaper or kill the process.
+    fn check_reload(&mut self) {
+        if !self.reload.watch || !self.reload.watcher.changed() {
+            return;
+        }
+        self.apply_config("config file changed");
+    }
+
+    /// Re-read and apply the config. Shared by the file watcher and the
+    /// `SIGHUP` source, which wake the loop independently.
+    ///
+    /// A config that fails to parse or validate is logged and ignored: the last
+    /// good one keeps running. That is the whole point of doing this live rather
+    /// than at startup — being mid-edit and saving a half-finished file must not
+    /// blank the wallpaper or kill the process.
+    fn apply_config(&mut self, reason: &str) {
+        info!("reloading config ({reason})");
+        match Config::load(Some(&self.reload.path)) {
+            Ok(config) => {
+                self.power_save = config.power_save.clone();
+                // The battery state may have changed meaning: `enabled` could
+                // have been turned off, or the new cap applied while unplugged.
+                self.on_battery = false;
+                self.check_power();
+                self.reload.watch = config.reload.watch;
+                self.source.reconfigure(&config, self.width, self.height);
+                info!("config reloaded");
+            }
+            Err(e) => log::error!("config reload failed, keeping the previous config: {e:#}"),
+        }
+    }
+
     /// Notice a change of power source and tell the source about it.
     /// Unplugging costs a throttled wallpaper; plugging back in must always
     /// restore full speed. Called once per frame, and it costs one atomic load.
@@ -259,6 +329,7 @@ impl App {
         // Cheap enough to do every frame (one atomic load), and it means a
         // battery change takes effect as soon as the background thread sees it.
         self.check_power();
+        self.check_reload();
         let layer = match &self.layer {
             Some(l) => l,
             None => return,

@@ -113,6 +113,58 @@ impl<'de> Deserialize<'de> for Color {
 pub struct Config {
     #[serde(default)]
     pub colors: Colors,
+
+    /// How the config is re-read while running.
+    #[serde(default)]
+    pub reload: ReloadConfig,
+}
+
+/// Live config reloading, so tweaking a colour doesn't mean restarting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReloadConfig {
+    /// Re-read the config when the file changes on disk. `rustbar --reload`
+    /// reloads regardless of this setting.
+    #[serde(default = "default_true")]
+    pub watch: bool,
+
+    /// How often to check the config file for changes, in milliseconds. Only the
+    /// file's mtime and size are compared per tick; it is re-parsed when one of
+    /// them actually moved.
+    #[serde(default = "default_reload_interval_ms")]
+    pub interval_ms: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_reload_interval_ms() -> u64 {
+    500
+}
+
+impl Default for ReloadConfig {
+    fn default() -> Self {
+        ReloadConfig {
+            watch: true,
+            interval_ms: 500,
+        }
+    }
+}
+
+impl ReloadConfig {
+    /// Clamped to a range that is neither "re-parse every frame" nor "effectively
+    /// never".
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.interval_ms.clamp(50, 60_000))
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.interval_ms == 0 {
+            anyhow::bail!("reload.interval_ms must be greater than 0");
+        }
+        Ok(())
+    }
 }
 
 /// The whole palette. These were previously constants in `theme.rs`, kept in
@@ -181,13 +233,15 @@ impl Config {
         Ok(dir.join("rustbar").join("config.toml"))
     }
 
-    /// Load the config, creating a commented template if there isn't one yet.
+    /// Load and validate the config, creating a commented template if there
+    /// isn't one yet.
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
         let path = Self::path(explicit)?;
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 let config: Config = toml::from_str(&contents)
                     .with_context(|| format!("failed to parse config file {}", path.display()))?;
+                config.reload.validate()?;
                 log::info!("loaded config from {}", path.display());
                 Ok(config)
             }
@@ -323,6 +377,48 @@ mod tests {
             .map(|l| format!("{l}\n"))
             .collect();
         assert_eq!(toml::from_str::<Config>(&live).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn reload_defaults_to_watching() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.reload.watch);
+        assert_eq!(config.reload.interval_ms, 500);
+    }
+
+    #[test]
+    fn reload_is_configurable_and_validated() {
+        let config: Config =
+            toml::from_str("[reload]\nwatch = false\ninterval_ms = 2000\n").unwrap();
+        assert!(!config.reload.watch);
+        assert_eq!(config.reload.interval().as_millis(), 2000);
+
+        // A zero interval would mean re-parsing on every tick.
+        let config: Config = toml::from_str("[reload]\ninterval_ms = 0\n").unwrap();
+        assert!(config.reload.validate().is_err());
+        // Absurd values are clamped rather than rejected, so a typo can't stop
+        // the bar from reloading at all.
+        let config: Config = toml::from_str("[reload]\ninterval_ms = 99999999\n").unwrap();
+        assert_eq!(config.reload.interval().as_secs(), 60);
+    }
+
+    /// A palette swap must be visible to the draw sites, which is the whole
+    /// point of reloading: `theme::colors()` is what every module reads.
+    #[test]
+    fn a_reload_replaces_the_live_palette() {
+        let red = Config {
+            colors: Colors {
+                accent: Color::rgb(255, 64, 64),
+                ..Colors::default()
+            },
+            ..Config::default()
+        };
+        crate::theme::init(&red);
+        assert_eq!(crate::theme::accent(), Color::rgb(255, 64, 64));
+
+        // And back again, proving it's a swap rather than a set-once.
+        crate::theme::init(&Config::default());
+        assert_eq!(crate::theme::accent(), Color::rgb(191, 255, 217));
     }
 
     #[test]

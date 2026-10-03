@@ -1,8 +1,8 @@
+use crate::theme::SIDE_MARGIN;
 use anyhow::{Context, Result, anyhow, bail};
 use calloop::EventLoop;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
-use crate::theme::SIDE_MARGIN;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
@@ -16,8 +16,13 @@ use smithay_client_toolkit::{
     },
     shell::{
         WaylandSurface,
-        wlr_layer::{Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
-        xdg::{XdgShell, popup::{Popup, PopupHandler, PopupConfigure}},
+        wlr_layer::{
+            Anchor, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
+        },
+        xdg::{
+            XdgShell,
+            popup::{Popup, PopupConfigure, PopupHandler},
+        },
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
@@ -27,8 +32,9 @@ use wayland_client::{
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
 
-use crate::clock::Clock;
 use crate::cava::Cava;
+use crate::clock::Clock;
+use crate::config::Config;
 use crate::hypr::{self, HyprEvent};
 use crate::menu_popup::MenuPopup;
 use crate::tray::{self};
@@ -86,18 +92,22 @@ fn run_sync(cmd: &str, args: &[&str]) {
     }
 }
 
-pub fn run(monitor: Option<String>, bar_height: u32, mut clock: Box<Clock>) -> Result<()> {
+pub fn run(
+    monitor: Option<String>,
+    bar_height: u32,
+    mut clock: Box<Clock>,
+    config_path: &std::path::Path,
+    config: &Config,
+) -> Result<()> {
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
-    let (globals, mut event_queue) = registry_queue_init::<App>(&conn)
-        .context("failed to enumerate Wayland globals")?;
+    let (globals, mut event_queue) =
+        registry_queue_init::<App>(&conn).context("failed to enumerate Wayland globals")?;
     let qh = event_queue.handle();
 
     let compositor_state =
         CompositorState::bind(&globals, &qh).context("wl_compositor not available")?;
-    let layer_shell =
-        LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available")?;
-    let xdg_shell =
-        XdgShell::bind(&globals, &qh).context("xdg_wm_base not available")?;
+    let layer_shell = LayerShell::bind(&globals, &qh).context("wlr-layer-shell not available")?;
+    let xdg_shell = XdgShell::bind(&globals, &qh).context("xdg_wm_base not available")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm not available")?;
     // SeatState::new (below, in App) already binds wl_seat via registry handling —
     // new_capability fires once the compositor advertises Pointer.
@@ -141,10 +151,19 @@ pub fn run(monitor: Option<String>, bar_height: u32, mut clock: Box<Clock>) -> R
         tray: None,
         menu: None,
         scroll_accum: 0.0,
+        reload: Reload {
+            watcher: rwconfig::Watcher::new(config_path.to_path_buf(), config.reload.interval()),
+            path: config_path.to_path_buf(),
+            watch: config.reload.watch,
+        },
     };
 
-    event_queue.roundtrip(&mut app).context("initial roundtrip failed")?;
-    event_queue.roundtrip(&mut app).context("output info roundtrip failed")?;
+    event_queue
+        .roundtrip(&mut app)
+        .context("initial roundtrip failed")?;
+    event_queue
+        .roundtrip(&mut app)
+        .context("output info roundtrip failed")?;
 
     let outputs: Vec<_> = app.output_state.outputs().collect();
     if outputs.is_empty() {
@@ -185,11 +204,14 @@ pub fn run(monitor: Option<String>, bar_height: u32, mut clock: Box<Clock>) -> R
     layer.set_size(0, bar_height);
     layer.commit();
 
-    app.pool = Some(SlotPool::new(4096 * bar_height as usize * 4, &app.shm)
-        .context("failed to create shm pool")?);
+    app.pool = Some(
+        SlotPool::new(4096 * bar_height as usize * 4, &app.shm)
+            .context("failed to create shm pool")?,
+    );
     app.layer = Some(layer);
 
-    let mut event_loop: EventLoop<App> = EventLoop::try_new().context("failed to create event loop")?;
+    let mut event_loop: EventLoop<App> =
+        EventLoop::try_new().context("failed to create event loop")?;
     let loop_handle = event_loop.handle();
 
     while !app.configured {
@@ -232,7 +254,10 @@ pub fn run(monitor: Option<String>, bar_height: u32, mut clock: Box<Clock>) -> R
 
     let (tray_tx, tray_rx) = calloop::channel::channel::<()>();
     let (tray_icons, tray_cmd_tx) = tray::spawn(tray_tx);
-    app.tray = Some(crate::tray_render::TrayRenderer::new(tray_icons, tray_cmd_tx));
+    app.tray = Some(crate::tray_render::TrayRenderer::new(
+        tray_icons,
+        tray_cmd_tx,
+    ));
     let qh_for_tray = qh.clone();
     loop_handle
         .insert_source(tray_rx, move |event, _, app: &mut App| {
@@ -253,6 +278,40 @@ pub fn run(monitor: Option<String>, bar_height: u32, mut clock: Box<Clock>) -> R
         })
         .map_err(|e| anyhow!("failed to insert cava event source: {e}"))?;
     app.cava.spawn(cava_tx);
+
+    // Config reloading. The poll timer is what makes an edit to the file take
+    // effect; the signal source is what makes `--reload` immediate, since the
+    // loop is otherwise parked in `dispatch` and would only notice on the next
+    // one-second tick at best.
+    if config.reload.watch {
+        let qh_for_reload = qh.clone();
+        let interval = config.reload.interval();
+        loop_handle
+            .insert_source(
+                Timer::from_duration(interval),
+                move |_deadline, _, app: &mut App| {
+                    // A colour change alone needs no redraw — every draw site
+                    // reads the palette fresh — but redrawing costs nothing at
+                    // one second's cadence and keeps the reload honest if a
+                    // future option turns out to affect layout.
+                    app.check_reload();
+                    app.draw(&qh_for_reload);
+                    TimeoutAction::ToDuration(interval)
+                },
+            )
+            .map_err(|e| anyhow!("failed to insert reload timer: {e}"))?;
+    }
+
+    #[cfg(unix)]
+    loop_handle
+        .insert_source(
+            calloop::signals::Signals::new(&[calloop::signals::Signal::SIGHUP])
+                .context("failed to create SIGHUP source")?,
+            |_, _, app: &mut App| {
+                app.reload_config("SIGHUP");
+            },
+        )
+        .map_err(|e| anyhow!("failed to insert SIGHUP source: {e}"))?;
 
     loop {
         event_loop.dispatch(None, &mut app)?;
@@ -298,20 +357,62 @@ pub(crate) struct App {
     /// 15px, i.e. you have to flick the touchpad hard. Accumulating here and
     /// consuming whole steps out of the running total fixes that.
     scroll_accum: f64,
+    /// Live config reloading: the file watcher plus where to re-read from.
+    reload: Reload,
+}
+
+/// How the running config is kept in sync with the file on disk.
+pub(crate) struct Reload {
+    watcher: rwconfig::Watcher,
+    path: std::path::PathBuf,
+    watch: bool,
 }
 
 impl App {
+    /// Re-read the config if the file changed on disk, and apply it.
+    fn check_reload(&mut self) {
+        if !self.reload.watch || !self.reload.watcher.changed() {
+            return;
+        }
+        self.reload_config("config file changed");
+    }
+
+    /// Re-read and apply the config.
+    ///
+    /// A config that fails to parse or validate is logged and ignored: the last
+    /// good one keeps running. That's the point of reloading live rather than at
+    /// startup — saving a half-finished file mid-edit must not take the bar off
+    /// the screen.
+    fn reload_config(&mut self, reason: &str) {
+        log::info!("reloading config ({reason})");
+        match Config::load(Some(&self.reload.path)) {
+            Ok(config) => {
+                crate::theme::init(&config);
+                self.reload.watch = config.reload.watch;
+                log::info!("config reloaded");
+            }
+            Err(e) => log::error!("config reload failed, keeping the previous config: {e:#}"),
+        }
+    }
+
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
         let (width, height) = (self.width, self.height);
         if width == 0 || height == 0 {
             return;
         }
         let stride = width as i32 * 4;
-        let layer = self.layer.as_ref().expect("draw called before layer surface exists");
+        let layer = self
+            .layer
+            .as_ref()
+            .expect("draw called before layer surface exists");
         let pool = self.pool.as_mut().expect("draw called before pool exists");
 
-        let (buffer, canvas) = match pool.create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
-        {
+        let (buffer, canvas) = match pool.create_buffer(
+            width as i32,
+            height as i32,
+            stride,
+            wl_shm::Format::Argb8888,
+        ) {
             Ok(v) => v,
             Err(err) => {
                 log::error!("failed to allocate shm buffer: {err}");
@@ -326,8 +427,15 @@ impl App {
             pixel[3] = 0; // fully transparent — argb8888 is premultiplied, so 0 alpha means 0 everywhere
         }
 
-        self.clock.render(canvas, SIDE_MARGIN, width - SIDE_MARGIN, height, stride as u32);
-        self.workspaces.render(canvas, SIDE_MARGIN, height, stride as u32);
+        self.clock.render(
+            canvas,
+            SIDE_MARGIN,
+            width - SIDE_MARGIN,
+            height,
+            stride as u32,
+        );
+        self.workspaces
+            .render(canvas, SIDE_MARGIN, height, stride as u32);
         // cava: waybar `modules-left = [hyprland/workspaces, cava]` — sits right
         // after workspaces with the waybar 6px gap (`#workspaces { margin: 0
         // 6px 0 0 }` right margin) between them.
@@ -336,13 +444,17 @@ impl App {
         // Right side: the seamless widget strip is rightmost (battery right
         // cap at the inset edge); the tray is rendered to its LEFT with the
         // waybar 14px gap between them.
-        let widgets_w = self.widgets.render(canvas, width - SIDE_MARGIN, height, stride as u32);
+        let widgets_w = self
+            .widgets
+            .render(canvas, width - SIDE_MARGIN, height, stride as u32);
         let tray_right = width - SIDE_MARGIN - widgets_w - if widgets_w > 0 { 14 } else { 0 };
         if let Some(tray) = &mut self.tray {
             tray.render(canvas, tray_right, height, stride as u32);
         }
 
-        layer.wl_surface().damage_buffer(0, 0, width as i32, height as i32);
+        layer
+            .wl_surface()
+            .damage_buffer(0, 0, width as i32, height as i32);
         if let Err(err) = buffer.attach_to(layer.wl_surface()) {
             log::error!("failed to attach buffer: {err}");
             return;
@@ -364,8 +476,12 @@ impl App {
         // left edge (the parent surface's coordinate origin), not the distance
         // from the right edge.
         let click_x = click_x as i32;
-        let Some(parent_layer) = self.layer.as_ref() else { return; };
-        let Some(seat) = self.seat.as_ref() else { return; };
+        let Some(parent_layer) = self.layer.as_ref() else {
+            return;
+        };
+        let Some(seat) = self.seat.as_ref() else {
+            return;
+        };
         let seat = seat.clone();
         match crate::menu_popup::MenuPopup::create(
             qh,
@@ -397,7 +513,14 @@ impl App {
 }
 
 impl CompositorHandler for App {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
     fn transform_changed(
         &mut self,
         _: &Connection,
@@ -407,8 +530,22 @@ impl CompositorHandler for App {
     ) {
     }
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
-    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl OutputHandler for App {
@@ -537,8 +674,14 @@ impl PointerHandler for App {
         events: &[PointerEvent],
     ) {
         for event in events {
-            let on_bar = self.layer.as_ref().map_or(false, |l| l.wl_surface() == &event.surface);
-            let on_menu = self.menu.as_ref().map_or(false, |m| m.wl_surface() == &event.surface);
+            let on_bar = self
+                .layer
+                .as_ref()
+                .map_or(false, |l| l.wl_surface() == &event.surface);
+            let on_menu = self
+                .menu
+                .as_ref()
+                .map_or(false, |m| m.wl_surface() == &event.surface);
 
             if on_menu {
                 match event.kind {
@@ -596,14 +739,23 @@ impl PointerHandler for App {
                     // segments (volume/notification/brightness).
                     let widget_hover = matches!(
                         self.widgets.hit_test(x),
-                        Some(SegKind::Volume) | Some(SegKind::Notification) | Some(SegKind::Brightness)
+                        Some(SegKind::Volume)
+                            | Some(SegKind::Notification)
+                            | Some(SegKind::Brightness)
                     );
                     let hovering = self.workspaces.hit_test(x).is_some()
                         || self.cava.hit_test(x)
                         || widget_hover
-                        || self.tray.as_ref().map_or(false, |t| t.hit_test(x).is_some());
+                        || self
+                            .tray
+                            .as_ref()
+                            .map_or(false, |t| t.hit_test(x).is_some());
                     if let Some(tp) = &self.themed_pointer {
-                        let icon = if hovering { CursorIcon::Pointer } else { CursorIcon::Default };
+                        let icon = if hovering {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Default
+                        };
                         let _ = tp.set_cursor(conn, icon);
                     }
                     if hover_changed {
@@ -626,8 +778,10 @@ impl PointerHandler for App {
                             self.close_menu();
                             self.workspaces.switch_to(id);
                             self.draw(qh);
-                        } else if let Some(item_id) =
-                            self.tray.as_ref().and_then(|t| t.hit_test(x).map(|s| s.to_string()))
+                        } else if let Some(item_id) = self
+                            .tray
+                            .as_ref()
+                            .and_then(|t| t.hit_test(x).map(|s| s.to_string()))
                         {
                             self.close_menu();
                             if let Some(tray) = &self.tray {
@@ -667,7 +821,9 @@ impl PointerHandler for App {
                                 let (menu_path, menu_items) = tray.menu_for(&item_id);
                                 if let Some(menu_path) = menu_path {
                                     if !menu_items.is_empty() {
-                                        self.open_menu(qh, item_id, menu_path, menu_items, x, serial);
+                                        self.open_menu(
+                                            qh, item_id, menu_path, menu_items, x, serial,
+                                        );
                                     }
                                 }
                             }
@@ -729,7 +885,13 @@ impl PointerHandler for App {
                             for _ in 0..n {
                                 run_sync(
                                     "wpctl",
-                                    &["set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", arg.as_str()],
+                                    &[
+                                        "set-volume",
+                                        "-l",
+                                        "1.0",
+                                        "@DEFAULT_AUDIO_SINK@",
+                                        arg.as_str(),
+                                    ],
                                 );
                             }
                             // The set ran to completion above, so this re-read
@@ -772,7 +934,6 @@ impl PointerHandler for App {
     }
 }
 
-
 impl ShmHandler for App {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
@@ -801,9 +962,7 @@ smithay_client_toolkit::delegate_xdg_popup!(App);
 // requirements. Both are simple no-ops for our use.
 use smithay_client_toolkit::globals::GlobalData;
 use wayland_protocols::xdg::{
-    decoration::zv1::client::zxdg_decoration_manager_v1::{
-        self, ZxdgDecorationManagerV1,
-    },
+    decoration::zv1::client::zxdg_decoration_manager_v1::{self, ZxdgDecorationManagerV1},
     shell::client::xdg_wm_base::{self, XdgWmBase},
 };
 impl Dispatch<XdgWmBase, GlobalData> for App {

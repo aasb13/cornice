@@ -213,6 +213,25 @@ pub struct Cube3dConfig {
 }
 
 impl Cube3dConfig {
+    /// The subset of settings that determines what gets rasterized.
+    ///
+    /// A live config reload compares this against the running config's key to
+    /// decide whether the glyph caches and cell grid have to be rebuilt. Two
+    /// configs with equal keys rasterize identically, so anything that changes
+    /// *what is drawn* rather than *how it is coloured or moved* belongs here —
+    /// and conversely, anything absent can be swapped in without re-tracing a
+    /// single font outline.
+    pub fn rasterization_key(&self) -> RasterizationKey<'_> {
+        RasterizationKey {
+            font_size: self.font_size.to_bits(),
+            font_path: self.font_path.as_deref(),
+            waterfall_font_path: self.waterfall_font_path.as_deref(),
+            ramp: &self.ramp,
+            vertex_glyph: &self.vertex_glyph,
+            rain_glyphs: &self.rain.glyphs,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !(4.0..=96.0).contains(&self.font_size) {
             bail!(
@@ -264,6 +283,44 @@ impl Cube3dConfig {
     pub fn ramp_bytes(&self) -> Vec<u8> {
         self.ramp.chars().map(|c| c as u32 as u8).collect()
     }
+}
+
+/// What [`RainConfig::population_key`] compares.
+///
+/// Floats are compared as their bit patterns rather than by value: `==` on `f32`
+/// makes `-0.0 == 0.0` and `NaN != NaN`, both of which would silently report
+/// "unchanged" and leave the rain in the old configuration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PopulationKey {
+    wall_count: u32,
+    speed: (u32, u32),
+    length: (u32, u32),
+    depth: (u32, u32),
+    fade: (u32, u32),
+    gradient_speed: (u32, u32),
+    grow_interval: (u32, u32),
+    mutate_interval: (u32, u32),
+    morph_duration: u32,
+    flash_duration: u32,
+    flash_rate: u32,
+    flash_brightness: u32,
+    color: Color,
+    filler_color: Color,
+    flash_color: Color,
+}
+
+/// What [`Cube3dConfig::rasterization_key`] compares. Derived `PartialEq` over
+/// only the fields that decide which glyphs get traced at which sizes, so
+/// adding a new visual setting doesn't silently require a rebuild (and adding a
+/// cached setting doesn't silently skip one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RasterizationKey<'a> {
+    font_size: u32,
+    font_path: Option<&'a str>,
+    waterfall_font_path: Option<&'a str>,
+    ramp: &'a str,
+    vertex_glyph: &'a str,
+    rain_glyphs: &'a str,
 }
 
 impl Default for Cube3dConfig {
@@ -393,6 +450,44 @@ pub struct RainConfig {
 }
 
 impl RainConfig {
+    /// The settings a wall's random parameters are drawn from.
+    ///
+    /// A live reload compares this to decide whether existing walls are still
+    /// consistent with each other. Walls are randomized once, at spawn, from
+    /// these values — so a change to any of them leaves survivors drawn under the
+    /// old rules, mixing two densities or two speeds on one screen. Everything
+    /// here is cheap to re-randomize (no font work), which is why these are kept
+    /// separate from [`RainConfig`]'s glyph settings: changing those costs a full
+    /// re-rasterization.
+    pub fn population_key(&self) -> PopulationKey {
+        PopulationKey {
+            wall_count: self.wall_count,
+            speed: (self.speed.min.to_bits(), self.speed.max.to_bits()),
+            length: (self.length.min, self.length.max),
+            depth: (self.depth.min.to_bits(), self.depth.max.to_bits()),
+            fade: (self.fade.min.to_bits(), self.fade.max.to_bits()),
+            gradient_speed: (
+                self.gradient_speed.min.to_bits(),
+                self.gradient_speed.max.to_bits(),
+            ),
+            grow_interval: (
+                self.grow_interval.min.to_bits(),
+                self.grow_interval.max.to_bits(),
+            ),
+            mutate_interval: (
+                self.mutate_interval.min.to_bits(),
+                self.mutate_interval.max.to_bits(),
+            ),
+            morph_duration: self.morph_duration.to_bits(),
+            flash_duration: self.flash_duration.to_bits(),
+            flash_rate: self.flash_rate.to_bits(),
+            flash_brightness: self.flash_brightness.to_bits(),
+            color: self.color,
+            filler_color: self.filler_color,
+            flash_color: self.flash_color,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.glyphs.is_empty() {
             bail!("cube3d.rain.glyphs must contain at least one character");
