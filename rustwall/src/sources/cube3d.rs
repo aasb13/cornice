@@ -22,22 +22,12 @@
 //!   * A wall's per-slot colour and brightness are precomputed when it spawns,
 //!     so the draw path is a lookup rather than a lerp and a `powi` per glyph.
 
-use crate::config::{FONT_PATHS, PowerSaveConfig, WATERFALL_FONT_PATH};
+use crate::config::{Color, Cube3dConfig, FONT_PATHS, PowerSaveConfig, WATERFALL_FONT_PATH};
 use crate::source::FrameSource;
 use rusttype::{Font, Scale, point};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-
-/// Classic ASCII-art ramp: brightest on the left, darkest (space) on right.
-/// Wider than before (14 steps) so brightness falloff along a single edge
-/// reads as a smooth taper instead of a couple of abrupt jumps.
-const RAMP: &[u8] = b"@$#%8&oa*+=-:. ";
-
-/// Glyph pool for the Matrix-style rain. Latin letters, digits and symbols so
-/// every glyph exists in the bundled monospace fonts (katakana would not).
-/// Characters from ASCII ranges: 33-63, 90-95, 97-126
-const RAIN: &[u8] = b"!\"#$%&'()*+,-./0123456789:;<=>?@Z[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
 /// Sentinel stored in a wall's cell buffers for "no glyph here" (a slot that
 /// has not been revealed yet, or that is crossfading in from nothing). Chosen
@@ -46,24 +36,10 @@ const RAIN: &[u8] = b"!\"#$%&'()*+,-./0123456789:;<=>?@Z[\\]^_`abcdefghijklmnopq
 const NO_GLYPH: u8 = 0xff;
 
 /// Integer glyph scales the rain atlas is built for. A wall's scale is
-/// `24 * factor`, and `factor` is clamped to 0.32..=1.55, so every wall lands
-/// inside 8..=37 after rounding.
+/// `font_size * factor`, and `factor` is clamped to the rain's configured depth
+/// range, so this is only a backstop against rasterizing something absurd.
 const MIN_SCALE: u32 = 8;
 const MAX_SCALE: u32 = 38;
-
-/// Lookup table mapping an ASCII byte to its index in `RAMP` (used by the
-/// tesseract grid, which stores ramp indices rather than characters).
-const RAMP_INDEX: [u8; 128] = ramp_index_table();
-
-const fn ramp_index_table() -> [u8; 128] {
-    let mut t = [0u8; 128];
-    let mut i = 0;
-    while i < RAMP.len() {
-        t[RAMP[i] as usize] = i as u8;
-        i += 1;
-    }
-    t
-}
 
 /// One falling wall of rain: a solid, one-symbol-wide column of glyphs that
 /// slides down smoothly and only resets once it is fully off the bottom of the
@@ -102,27 +78,35 @@ struct Waterfall {
 /// (bottom) edge. Computed once per wall rather than per frame per slot.
 #[derive(Clone, Copy)]
 struct SlotStyle {
-    rgb: (f32, f32, f32),
+    rgb: Color,
     bright: f32,
 }
 
-/// The font size the tesseract (and the rain's nominal size) is drawn at.
-const TESSERACT_FONT_SIZE: f32 = 24.0;
+/// The scene-wide z range of this frame's edges, so every edge's brightness
+/// gradient is calibrated against the same near/far reference rather than its
+/// own endpoints (which would make a short edge and a long edge both read as
+/// full-range).
+#[derive(Clone, Copy)]
+struct DepthRange {
+    min: f32,
+    span: f32,
+}
 
-/// The colour of the tesseract — kept bright so it's always the visual subject.
-const TESSERACT_COLOR: (f32, f32, f32) = (191.0, 255.0, 217.0);
+impl DepthRange {
+    fn new(depths: &[f32; 32]) -> Self {
+        let min = depths.iter().fold(f32::INFINITY, |m, &x| m.min(x));
+        let max = depths.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+        DepthRange {
+            min,
+            span: (max - min).max(1e-6),
+        }
+    }
 
-/// The colour of the rain — same hue family as the tesseract but dimmer and a
-/// touch desaturated, so the rain reads as background texture, not subject.
-const RAIN_COLOR: (f32, f32, f32) = (160.0, 210.0, 185.0);
-
-/// Dark green color for waterfall body (non-bottom glyphs).
-const RAIN_FILLER: (f32, f32, f32) = (20.0, 100.0, 20.0);
-
-/// How long a single "flash" glint pulse lasts, in seconds. Shared between
-/// update_waterfalls (which counts it down) and draw_waterfall (which turns
-/// the remaining time into a smooth bump-shaped brightness curve).
-const FLASH_DURATION: f32 = 0.45;
+    #[inline]
+    fn norm(&self, z: f32) -> f32 {
+        ((z - self.min) / self.span).clamp(0.0, 1.0)
+    }
+}
 
 /// A pre-rasterized glyph: an 8-bit coverage mask `data` (0..255 per pixel)
 /// plus its base position offsets, ready to be blitted each frame. Building
@@ -196,8 +180,14 @@ const fn edges() -> [[usize; 2]; 32] {
 pub struct RotatingTesseract {
     font: Option<Font<'static>>,
     waterfall_font: Option<Font<'static>>,
-    font_path: Option<String>,
-    waterfall_font_path: Option<String>,
+    /// Everything the config can tune about this source.
+    cfg: Cube3dConfig,
+    /// The glyph ramp the tesseract's cells pick from, brightest first.
+    ramp: Vec<u8>,
+    /// Index into `ramp` stamped at each vertex.
+    vertex_index: u8,
+    /// The rain's glyph pool.
+    rain_glyphs: Vec<u8>,
     /// Redraws per second ceiling; 0 = no cap (as fast as the compositor
     /// takes frames, i.e. the monitor's refresh rate).
     fps_cap: u32,
@@ -231,9 +221,8 @@ pub struct RotatingTesseract {
     column_cursor: usize,
     /// How many screen columns the rain grid has (== w / base char width).
     total_columns: usize,
-    /// The tesseract's ramp glyphs, indexed by `RAMP_INDEX`, at the tesseract's
-    /// own font size. Direct-indexed, so the edge/vertex draw path never
-    /// hashes.
+    /// The tesseract's ramp glyphs, indexed by position in `ramp`. Direct-
+    /// indexed, so the edge/vertex draw path never hashes.
     ramp_glyphs: Vec<Arc<Glyph>>,
     /// Rain glyphs keyed by integer font scale, each a direct-indexed slice
     /// over the rain pool. Built on demand (one scale at a time) and shared
@@ -245,21 +234,21 @@ pub struct RotatingTesseract {
 }
 
 impl RotatingTesseract {
-    pub fn new(
-        font_path: Option<String>,
-        waterfall_font_path: Option<String>,
-        fps_cap: u32,
-        power_save: PowerSaveConfig,
-    ) -> Self {
+    pub fn new(cfg: Cube3dConfig, fps_cap: u32, power_save: PowerSaveConfig) -> Self {
         let seed = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E3779B97F4A7C15);
+        let ramp = cfg.ramp_bytes();
+        let vertex_index = cfg.vertex_index().min(ramp.len().saturating_sub(1)) as u8;
+        let rain_glyphs = cfg.rain.glyphs.chars().map(|c| c as u32 as u8).collect();
         Self {
             font: None,
             waterfall_font: None,
-            font_path,
-            waterfall_font_path,
+            cfg,
+            ramp,
+            vertex_index,
+            rain_glyphs,
             fps_cap,
             power_save,
             power_saving: false,
@@ -285,6 +274,11 @@ impl RotatingTesseract {
         }
     }
 
+    /// The font size the tesseract — and the rain's nominal size — is drawn at.
+    fn font_size(&self) -> f32 {
+        self.cfg.font_size
+    }
+
     /// Advance the xorshift64 PRNG.
     fn next_rng(rng: &mut u64) -> u64 {
         let mut x = *rng;
@@ -301,8 +295,11 @@ impl RotatingTesseract {
         lo + (hi - lo) * r
     }
 
-    fn rand_glyph(rng: &mut u64) -> u8 {
-        (Self::next_rng(rng) % RAIN.len() as u64) as u8
+    fn rand_glyph(rng: &mut u64, pool: usize) -> u8 {
+        if pool == 0 {
+            return NO_GLYPH;
+        }
+        (Self::next_rng(rng) % pool as u64) as u8
     }
 
     /// Fisher-Yates shuffle using the xorshift PRNG.
@@ -333,11 +330,15 @@ impl RotatingTesseract {
 
     /// (Re)initialise every rain wall with fresh random parameters.
     fn spawn_waterfalls(&mut self) {
+        if !self.cfg.rain.enabled {
+            self.waterfalls.clear();
+            return;
+        }
         let base = self.char_height.max(1.0);
         let col_w = self.char_width.max(1.0);
         let w = self.width as f32;
         let h = self.height as f32;
-        let count = (10 + (Self::next_rng(&mut self.rng) % 7) as usize) * 20; // 200..=320
+        let count = self.cfg.rain.wall_count as usize;
 
         // Lock rain to the same column grid as the screen's own character
         // cells. total_columns is deliberately generous (more columns than
@@ -357,6 +358,8 @@ impl RotatingTesseract {
             rain_atlas,
             waterfall_font,
             font,
+            rain_glyphs,
+            cfg,
             ..
         } = self;
         let wf_font: Option<&Font<'static>> = waterfall_font.as_ref().or(font.as_ref());
@@ -384,7 +387,19 @@ impl RotatingTesseract {
                 grow_interval: 0.08,
                 column: c,
             };
-            Self::randomise_waterfall(rng, rain_atlas, wf_font, &mut wf, base, col_w, w, h, c);
+            Self::randomise_waterfall(
+                rng,
+                rain_atlas,
+                rain_glyphs,
+                cfg,
+                wf_font,
+                &mut wf,
+                base,
+                col_w,
+                w,
+                h,
+                c,
+            );
             waterfalls.push(wf);
         }
     }
@@ -393,9 +408,12 @@ impl RotatingTesseract {
     /// and precompute everything the draw path needs from it. Takes the pieces
     /// of `self` it touches rather than `&mut self`, so it can be called from
     /// both `spawn_waterfalls` and the per-frame update loop.
+    #[allow(clippy::too_many_arguments)]
     fn randomise_waterfall(
         rng: &mut u64,
         rain_atlas: &mut HashMap<u32, Vec<Arc<Glyph>>>,
+        rain_glyphs: &[u8],
+        cfg: &Cube3dConfig,
         font: Option<&Font<'static>>,
         wf: &mut Waterfall,
         base: f32,
@@ -404,10 +422,11 @@ impl RotatingTesseract {
         h: f32,
         col: usize,
     ) {
-        // Random depth along the view axis: nearer -> larger factor & brighter.
-        let z = Self::rand_range(rng, -5.5, 3.0);
-        wf.factor = (1.0 + z * 0.11).clamp(0.32, 1.55);
-        let norm = ((wf.factor - 0.32) / (1.55 - 0.32)).clamp(0.0, 1.0);
+        let rain = &cfg.rain;
+
+        // Depth along the view axis: nearer -> larger factor & brighter.
+        wf.factor = rain.depth.sample(Self::rand_range(rng, 0.0, 1.0));
+        let norm = rain.depth.norm(wf.factor);
         // Capped well below the tesseract's brightness range (see RAMP-driven
         // edge brightness in render()) so the rain never competes with it.
         wf.atten = (0.15 + 0.70 * norm) * 1.4;
@@ -418,19 +437,18 @@ impl RotatingTesseract {
         // drifting to arbitrary, overlapping positions.
         wf.column = col;
         wf.x = (col as f32 * col_w).clamp(0.0, (w - col_w).max(0.0));
-        wf.speed = Self::rand_range(rng, 180.0, 440.0);
-        wf.fade = Self::rand_range(rng, 0.62, 0.85);
-        wf.gradient_speed = Self::rand_range(rng, 0.01, 0.05);
+        wf.speed = rain.speed.sample(Self::rand_range(rng, 0.0, 1.0));
+        wf.fade = rain.fade.sample(Self::rand_range(rng, 0.0, 1.0));
+        wf.gradient_speed = rain.gradient_speed.sample(Self::rand_range(rng, 0.0, 1.0));
         wf.pitch = base * wf.factor;
 
-        // A wall is a solid stack of symbols, fully-filled (no gaps). Noticeably
-        // tall (~3x earlier) so it reads as a true falling column.
-        let len = (Self::rand_range(rng, 12.0, 42.0).round()) as usize;
-        wf.len = len.max(2);
+        // A wall is a solid stack of symbols, fully-filled (no gaps), long
+        // enough to read as a true falling column.
+        wf.len = rain.length.sample(Self::next_rng(rng) as u32).max(2) as usize;
         wf.cells.clear();
         wf.cells.reserve(wf.len);
         for _ in 0..wf.len {
-            wf.cells.push(Self::rand_glyph(rng));
+            wf.cells.push(Self::rand_glyph(rng, rain_glyphs.len()));
         }
         // Every slot starts with nothing to crossfade from; slot 0 gets its
         // own fade-in the moment the wall starts growing (see below).
@@ -445,20 +463,22 @@ impl RotatingTesseract {
         wf.mutate_t.clear();
         wf.mutate_t.reserve(wf.len);
         for _ in 0..wf.len {
-            wf.mutate_t.push(Self::rand_range(rng, 3.0, 9.0));
+            wf.mutate_t
+                .push(rain.mutate_interval.sample(Self::rand_range(rng, 0.0, 1.0)));
         }
         wf.flash_t.clear();
         wf.flash_t.resize(wf.len, 0.0);
 
         // Bind this wall to the glyph set for its scale. Scales are rasterized
         // on first use and shared with every other wall at the same scale.
-        let scale = ((TESSERACT_FONT_SIZE * wf.factor).round() as u32).clamp(MIN_SCALE, MAX_SCALE);
+        let scale = ((cfg.font_size * wf.factor).round() as u32).clamp(MIN_SCALE, MAX_SCALE);
         wf.glyphs = match rain_atlas.get(&scale) {
             Some(v) => v.clone(),
             None => {
                 let built: Vec<Arc<Glyph>> = match font {
-                    Some(f) => (0..RAIN.len())
-                        .map(|i| Arc::new(Self::rasterize_glyph(f, RAIN[i] as char, scale as f32)))
+                    Some(f) => rain_glyphs
+                        .iter()
+                        .map(|&b| Arc::new(Self::rasterize_glyph(f, b as char, scale as f32)))
                         .collect(),
                     None => Vec::new(),
                 };
@@ -475,11 +495,7 @@ impl RotatingTesseract {
         wf.style.reserve(wf.len);
         for d in 0..wf.len {
             let gp = (d as f32 * wf.gradient_speed).clamp(0.0, 1.0);
-            let rgb = (
-                RAIN_COLOR.0 + (RAIN_FILLER.0 - RAIN_COLOR.0) * gp,
-                RAIN_COLOR.1 + (RAIN_FILLER.1 - RAIN_COLOR.1) * gp,
-                RAIN_COLOR.2 + (RAIN_FILLER.2 - RAIN_COLOR.2) * gp,
-            );
+            let rgb = rain.color.lerp(rain.filler_color, gp);
             let bright = ((0.7 + 0.3 * falloff) * wf.atten).clamp(0.0, 1.0);
             wf.style.push(SlotStyle { rgb, bright });
             falloff *= wf.fade;
@@ -490,7 +506,7 @@ impl RotatingTesseract {
         // extending the column downward, until it reaches its full length.
         // Only then does the whole block begin sliding as a rigid body.
         wf.grown = 0;
-        wf.grow_interval = Self::rand_range(rng, 0.05, 0.14);
+        wf.grow_interval = rain.grow_interval.sample(Self::rand_range(rng, 0.0, 1.0));
         wf.grow_t = wf.grow_interval;
 
         // Start with the wall's anchor above the screen so it slides in
@@ -515,9 +531,12 @@ impl RotatingTesseract {
             font,
             waterfall_font,
             rain_atlas,
+            rain_glyphs,
+            cfg,
             ..
         } = self;
         let wf_font: Option<&Font<'static>> = waterfall_font.as_ref().or(font.as_ref());
+        let rain = &cfg.rain;
 
         for wf in waterfalls.iter_mut() {
             // Only respawn once the wall's top edge has cleared the bottom of
@@ -534,7 +553,19 @@ impl RotatingTesseract {
             wf.y += wf.speed * dt;
 
             if let Some(col) = new_col {
-                Self::randomise_waterfall(rng, rain_atlas, wf_font, wf, base, col_w, w, h, col);
+                Self::randomise_waterfall(
+                    rng,
+                    rain_atlas,
+                    rain_glyphs,
+                    cfg,
+                    wf_font,
+                    wf,
+                    base,
+                    col_w,
+                    w,
+                    h,
+                    col,
+                );
                 continue;
             }
 
@@ -553,7 +584,7 @@ impl RotatingTesseract {
                     wf.morph_t[j] = 0.0;
                     // Give the freshly-revealed glyph a long, staggered wait
                     // before it's eligible to mutate again.
-                    wf.mutate_t[j] = Self::rand_range(rng, 3.0, 9.0);
+                    wf.mutate_t[j] = rain.mutate_interval.sample(Self::rand_range(rng, 0.0, 1.0));
                 }
             }
 
@@ -563,7 +594,7 @@ impl RotatingTesseract {
             for j in 0..wf.grown {
                 // Crossfade progress for an in-flight glyph change.
                 if wf.morph_t[j] < 1.0 {
-                    wf.morph_t[j] = (wf.morph_t[j] + dt / 0.35).min(1.0);
+                    wf.morph_t[j] = (wf.morph_t[j] + dt / rain.morph_duration).min(1.0);
                 }
 
                 // Per-glyph mutation: rare, staggered, and only for glyphs
@@ -573,20 +604,20 @@ impl RotatingTesseract {
                 wf.mutate_t[j] -= dt;
                 if wf.mutate_t[j] <= 0.0 && wf.morph_t[j] >= 1.0 {
                     wf.prev_cells[j] = wf.cells[j];
-                    wf.cells[j] = Self::rand_glyph(rng);
+                    wf.cells[j] = Self::rand_glyph(rng, rain_glyphs.len());
                     wf.morph_t[j] = 0.0;
-                    wf.mutate_t[j] = Self::rand_range(rng, 3.0, 9.0);
+                    wf.mutate_t[j] = rain.mutate_interval.sample(Self::rand_range(rng, 0.0, 1.0));
                 }
 
-                // Smooth flash pulse: once triggered, flash_t counts down
-                // from FLASH_DURATION to 0 over several frames, and the
-                // brightness follows a bump curve (draw_waterfall reads
-                // flash_t), so it visibly ramps up and fades out instead of
-                // slamming on and off in a single frame.
+                // Smooth flash pulse: once triggered, flash_t counts down from
+                // flash_duration to 0 over several frames, and the brightness
+                // follows a bump curve (draw_waterfall reads flash_t), so it
+                // visibly ramps up and fades out instead of slamming on and
+                // off in a single frame.
                 if wf.flash_t[j] > 0.0 {
                     wf.flash_t[j] = (wf.flash_t[j] - dt).max(0.0);
-                } else if Self::rand_range(rng, 0.0, 1.0) < dt * 0.04 {
-                    wf.flash_t[j] = FLASH_DURATION;
+                } else if Self::rand_range(rng, 0.0, 1.0) < dt * rain.flash_rate {
+                    wf.flash_t[j] = rain.flash_duration;
                 }
             }
         }
@@ -623,23 +654,22 @@ impl RotatingTesseract {
     /// brightness) is interpolated per-step along the line rather than fixed
     /// for the whole edge — otherwise a long edge is just one character
     /// copy-pasted end to end, which is what made edges read as flat
-    /// typographic blocks instead of shaded lines. `dmin`/`span` are the
-    /// scene-wide depth range (same as used for the edge sort) so every
-    /// edge's gradient is calibrated consistently against every other edge.
+    /// typographic blocks instead of shaded lines. `depth` is the scene-wide
+    /// depth range (same one used for the edge sort) so every edge's gradient is
+    /// calibrated consistently against every other edge.
     fn draw_line(
         grid: &mut [Option<(u8, f32)>],
         cols: u32,
+        ramp_len: usize,
         a: [f32; 2],
         b: [f32; 2],
         depth_a: f32,
         depth_b: f32,
-        dmin: f32,
-        span: f32,
+        depth: DepthRange,
     ) {
         let steps = ((b[0] - a[0]).abs().max((b[1] - a[1]).abs())).round() as i32;
         let steps = steps.max(1);
         let inv = 1.0 / steps as f32;
-        let inv_span = 1.0 / span;
         for i in 0..=steps {
             let t = i as f32 * inv;
             let x = (a[0] + (b[0] - a[0]) * t).round() as i32;
@@ -647,16 +677,16 @@ impl RotatingTesseract {
             if x < 0 || y < 0 {
                 continue;
             }
-            let depth = depth_a + (depth_b - depth_a) * t;
-            let bt = ((depth - dmin) * inv_span).clamp(0.0, 1.0);
+            let d = depth_a + (depth_b - depth_a) * t;
+            let bt = depth.norm(d);
             // Floor raised from 0.5 to 0.35 so far cells still show *some*
             // faint texture rather than snapping straight to the brightest
             // 50%-and-up range everything used to live in.
             let bright = (0.35 + 0.65 * bt).clamp(0.0, 1.0);
-            let idx_ramp = ((1.0 - bright) * (RAMP.len() - 1) as f32) as u8;
+            let idx_ramp = ((1.0 - bright) * (ramp_len - 1) as f32) as u8;
             let idx = (y as u32 * cols + x as u32) as usize;
             if idx < grid.len() {
-                grid[idx] = Some((idx_ramp.min(RAMP.len() as u8 - 1), bright));
+                grid[idx] = Some((idx_ramp.min(ramp_len as u8 - 1), bright));
             }
         }
     }
@@ -671,20 +701,18 @@ impl RotatingTesseract {
         grid: &mut [Option<(u8, f32)>],
         cols: u32,
         rows: u32,
+        glyph_index: u8,
         p: [f32; 2],
-        depth: f32,
-        dmin: f32,
-        span: f32,
+        z: f32,
+        depth: DepthRange,
     ) {
-        let t = ((depth - dmin) / span).clamp(0.0, 1.0);
-        let bright = (0.65 + 0.35 * t).clamp(0.0, 1.0);
+        let bright = (0.65 + 0.35 * depth.norm(z)).clamp(0.0, 1.0);
         let x = p[0].round() as i32;
         let y = p[1].round() as i32;
         if x >= 0 && y >= 0 && x < cols as i32 && y < rows as i32 {
             let idx = (y as u32 * cols + x as u32) as usize;
             if idx < grid.len() {
-                // '@' is RAMP[0], the heavy marker.
-                grid[idx] = Some((RAMP_INDEX[b'@' as usize], bright));
+                grid[idx] = Some((glyph_index, bright));
             }
         }
     }
@@ -795,14 +823,12 @@ impl RotatingTesseract {
     /// brightness already folded in. Returns 0 when the result would be
     /// invisible, so callers can skip the blit entirely.
     #[inline]
-    fn pack(rgb: (f32, f32, f32), bright: f32) -> u32 {
+    fn pack(rgb: Color, bright: f32) -> u32 {
         if bright <= 0.0 {
             return 0;
         }
-        let b = (rgb.0 * bright).clamp(0.0, 255.0) as u32;
-        let g = (rgb.1 * bright).clamp(0.0, 255.0) as u32;
-        let r = (rgb.2 * bright).clamp(0.0, 255.0) as u32;
-        (b << 16) | (g << 8) | r
+        let [r, g, b] = rgb.scaled(bright);
+        ((b as u32) << 16) | ((g as u32) << 8) | r as u32
     }
 
     /// Blit a cached glyph's coverage mask into the canvas with its top-left
@@ -871,7 +897,7 @@ impl RotatingTesseract {
                 let n = (e - s) as usize;
                 let cov = &data[row as usize * w + s as usize..][..n];
                 let out = &mut canvas[row_base + (px + s as i32) as usize * 4..][..n * 4];
-                for (out, &c) in out.chunks_exact_mut(4).zip(cov) {
+                for (out, &c) in out.as_chunks_mut::<4>().0.iter_mut().zip(cov) {
                     let c = c as u32;
                     // Blue and red share one multiply: blue sits in the low
                     // byte and red in the third, so each product spans two
@@ -888,6 +914,10 @@ impl RotatingTesseract {
     /// Blit a glyph into a character cell: the cell's pixel origin, plus the
     /// glyph's own bearing and the baseline shift that scales with the font
     /// size.
+    ///
+    /// `baseline` is that shift already resolved for this glyph's scale —
+    /// `ascent * (scale / font_size)` — so the caller computes it once per wall
+    /// rather than once per glyph.
     #[inline]
     fn blit_cell(
         glyph: &Glyph,
@@ -897,12 +927,11 @@ impl RotatingTesseract {
         stride: usize,
         cell_x: f32,
         cell_y: f32,
-        ascent: f32,
-        scale: f32,
+        baseline: f32,
         col: u32,
     ) {
         let px = cell_x as i32 + glyph.min_x;
-        let py = (cell_y + ascent * (scale / TESSERACT_FONT_SIZE)) as i32 + glyph.min_y;
+        let py = (cell_y + baseline) as i32 + glyph.min_y;
         Self::blit(glyph, canvas, width, height, stride, px, py, col);
     }
 
@@ -920,7 +949,10 @@ impl RotatingTesseract {
         stride: usize,
         wf: &Waterfall,
     ) {
-        let scale = TESSERACT_FONT_SIZE * wf.factor;
+        let base_size = self.font_size();
+        let scale = base_size * wf.factor;
+        let baseline = self.ascent * (scale / base_size);
+        let rain = &self.cfg.rain;
         let h = height as f32;
         // While the wall is still writing itself, the newest (bottom) slot
         // is whichever one was most recently revealed, not the final length.
@@ -957,14 +989,10 @@ impl RotatingTesseract {
             let mut bright = st.bright;
             let mut color = st.rgb;
             if wf.flash_t[i] > 0.0 {
-                let progress = 1.0 - (wf.flash_t[i] / FLASH_DURATION).clamp(0.0, 1.0);
+                let progress = 1.0 - (wf.flash_t[i] / rain.flash_duration).clamp(0.0, 1.0);
                 let pulse = (std::f32::consts::PI * progress).sin(); // 0 -> 1 -> 0
-                bright = (bright + 0.55 * pulse).clamp(0.0, 1.0);
-                color = (
-                    RAIN_COLOR.0 + (220.0 - RAIN_COLOR.0) * pulse,
-                    RAIN_COLOR.1 + (255.0 - RAIN_COLOR.1) * pulse,
-                    RAIN_COLOR.2 + (230.0 - RAIN_COLOR.2) * pulse,
-                );
+                bright = (bright + rain.flash_brightness * pulse).clamp(0.0, 1.0);
+                color = rain.color.lerp(rain.flash_color, pulse);
             }
 
             // A glyph change (mutation or newly-grown symbol appearing)
@@ -973,21 +1001,20 @@ impl RotatingTesseract {
             if wf.morph_t[i] < 1.0 {
                 let t = wf.morph_t[i].clamp(0.0, 1.0);
                 let prev = wf.prev_cells[i];
-                if prev != NO_GLYPH {
-                    if let Some(g) = glyphs.get(prev as usize) {
-                        Self::blit_cell(
-                            g,
-                            canvas,
-                            width,
-                            height,
-                            stride,
-                            wf.x,
-                            y,
-                            self.ascent,
-                            scale,
-                            Self::pack(color, bright * (1.0 - t)),
-                        );
-                    }
+                if prev != NO_GLYPH
+                    && let Some(g) = glyphs.get(prev as usize)
+                {
+                    Self::blit_cell(
+                        g,
+                        canvas,
+                        width,
+                        height,
+                        stride,
+                        wf.x,
+                        y,
+                        baseline,
+                        Self::pack(color, bright * (1.0 - t)),
+                    );
                 }
                 if let Some(g) = glyphs.get(wf.cells[i] as usize) {
                     Self::blit_cell(
@@ -998,8 +1025,7 @@ impl RotatingTesseract {
                         stride,
                         wf.x,
                         y,
-                        self.ascent,
-                        scale,
+                        baseline,
                         Self::pack(color, bright * t),
                     );
                 }
@@ -1012,8 +1038,7 @@ impl RotatingTesseract {
                     stride,
                     wf.x,
                     y,
-                    self.ascent,
-                    scale,
+                    baseline,
                     Self::pack(color, bright),
                 );
             }
@@ -1058,7 +1083,7 @@ impl FrameSource for RotatingTesseract {
         // Build the font search list: an explicit config path first, then the
         // built-in fallbacks. Strings are cloned so the list doesn't hold a
         // borrow of `self`, which would conflict with later `&mut self` calls.
-        let search_paths: Vec<String> = if let Some(fp) = &self.font_path {
+        let search_paths: Vec<String> = if let Some(fp) = &self.cfg.font_path {
             std::iter::once(fp.clone())
                 .chain(FONT_PATHS.iter().map(|s| s.to_string()))
                 .collect()
@@ -1066,76 +1091,76 @@ impl FrameSource for RotatingTesseract {
             FONT_PATHS.iter().map(|s| s.to_string()).collect()
         };
 
-        let font_size = TESSERACT_FONT_SIZE;
+        let font_size = self.font_size();
         let scale = Scale::uniform(font_size);
 
         for path in &search_paths {
-            if let Ok(data) = std::fs::read(path) {
-                if let Some(font) = Font::try_from_vec(data) {
-                    let v_metrics = font.v_metrics(scale);
-                    let char_width = font.glyph(' ').scaled(scale).h_metrics().advance_width;
-                    let char_height = v_metrics.ascent - v_metrics.descent + v_metrics.line_gap;
+            if let Ok(data) = std::fs::read(path)
+                && let Some(font) = Font::try_from_vec(data)
+            {
+                let v_metrics = font.v_metrics(scale);
+                let char_width = font.glyph(' ').scaled(scale).h_metrics().advance_width;
+                let char_height = v_metrics.ascent - v_metrics.descent + v_metrics.line_gap;
 
-                    let grid_cols = ((width as f32 / char_width) as u32).max(1);
-                    let grid_rows = ((height as f32 / char_height) as u32).max(1);
+                let grid_cols = ((width as f32 / char_width) as u32).max(1);
+                let grid_rows = ((height as f32 / char_height) as u32).max(1);
 
-                    let offset_x = (width as f32 - (grid_cols as f32 * char_width)) / 2.0;
-                    let offset_y = (height as f32 - (grid_rows as f32 * char_height)) / 2.0;
+                let offset_x = (width as f32 - (grid_cols as f32 * char_width)) / 2.0;
+                let offset_y = (height as f32 - (grid_rows as f32 * char_height)) / 2.0;
 
-                    // Only the ramp characters are needed, and only at the
-                    // tesseract's own size.
-                    self.ramp_glyphs = RAMP
-                        .iter()
-                        .map(|&b| Arc::new(Self::rasterize_glyph(&font, b as char, font_size)))
-                        .collect();
-                    self.grid = vec![None; (grid_rows * grid_cols) as usize];
-                    self.font = Some(font);
-                    self.grid_cols = grid_cols;
-                    self.grid_rows = grid_rows;
-                    self.char_width = char_width;
-                    self.char_height = char_height;
-                    self.offset_x = offset_x;
-                    self.offset_y = offset_y;
-                    self.ascent = v_metrics.ascent;
-                    self.start_time = Instant::now();
-                    self.last_frame = Instant::now();
+                // Only the ramp characters are needed, and only at the
+                // tesseract's own size.
+                self.ramp_glyphs = self
+                    .ramp
+                    .clone()
+                    .iter()
+                    .map(|&b| Arc::new(Self::rasterize_glyph(&font, b as char, font_size)))
+                    .collect();
+                self.grid = vec![None; (grid_rows * grid_cols) as usize];
+                self.font = Some(font);
+                self.grid_cols = grid_cols;
+                self.grid_rows = grid_rows;
+                self.char_width = char_width;
+                self.char_height = char_height;
+                self.offset_x = offset_x;
+                self.offset_y = offset_y;
+                self.ascent = v_metrics.ascent;
+                self.start_time = Instant::now();
+                self.last_frame = Instant::now();
 
-                    log::info!("Loaded font from: {}", path);
+                log::info!("Loaded font from: {}", path);
 
-                    // Try to load a dedicated waterfall font (matrix code).
-                    // Falls back to the config path or the built-in default.
-                    let waterfall_path: String = self
-                        .waterfall_font_path
-                        .clone()
-                        .unwrap_or_else(|| WATERFALL_FONT_PATH.to_string());
-                    let wf_font = match std::fs::read(&waterfall_path) {
-                        Ok(wf_data) => match Font::try_from_vec(wf_data) {
-                            Some(f) => {
-                                log::info!("Loaded waterfall font from: {}", waterfall_path);
-                                f
-                            }
-                            None => {
-                                log::warn!(
-                                    "Failed to parse waterfall font from: {}",
-                                    waterfall_path
-                                );
-                                self.font.as_ref().unwrap().clone()
-                            }
-                        },
-                        Err(_) => {
-                            log::warn!("Waterfall font not found at: {}", waterfall_path);
+                // Try to load a dedicated waterfall font (matrix code).
+                // Falls back to the config path or the built-in default.
+                let waterfall_path: String = self
+                    .cfg
+                    .waterfall_font_path
+                    .clone()
+                    .unwrap_or_else(|| WATERFALL_FONT_PATH.to_string());
+                let wf_font = match std::fs::read(&waterfall_path) {
+                    Ok(wf_data) => match Font::try_from_vec(wf_data) {
+                        Some(f) => {
+                            log::info!("Loaded waterfall font from: {}", waterfall_path);
+                            f
+                        }
+                        None => {
+                            log::warn!("Failed to parse waterfall font from: {}", waterfall_path);
                             self.font.as_ref().unwrap().clone()
                         }
-                    };
-                    self.waterfall_font = Some(wf_font);
-                    self.rain_atlas.clear();
+                    },
+                    Err(_) => {
+                        log::warn!("Waterfall font not found at: {}", waterfall_path);
+                        self.font.as_ref().unwrap().clone()
+                    }
+                };
+                self.waterfall_font = Some(wf_font);
+                self.rain_atlas.clear();
 
-                    // Last, so the rain walls can bind their glyph slices from
-                    // the waterfall font we just settled on.
-                    self.spawn_waterfalls();
+                // Last, so the rain walls can bind their glyph slices from
+                // the waterfall font we just settled on.
+                self.spawn_waterfalls();
 
-                    return;
-                }
+                return;
             }
         }
 
@@ -1158,9 +1183,17 @@ impl FrameSource for RotatingTesseract {
     }
 
     fn render(&mut self, canvas: &mut [u8], width: u32, height: u32, stride: u32) -> bool {
-        // Clear to black. The fourth byte of an `Xrgb8888` pixel is unused, so
-        // the whole buffer can go in one memset-shaped fill.
-        canvas.fill(0);
+        // Fill with the configured background. Black is by far the common case and goes
+        // through as a single memset-shaped fill; anything else has to be written
+        // pixel by pixel.
+        if self.cfg.background.is_black() {
+            canvas.fill(0);
+        } else {
+            let [r, g, b] = self.cfg.background.scaled(1.0);
+            for px in canvas.as_chunks_mut::<4>().0 {
+                px.copy_from_slice(&[b, g, r, 0xff]);
+            }
+        }
 
         if !self.font.is_some() || self.grid_cols == 0 {
             return true;
@@ -1175,8 +1208,9 @@ impl FrameSource for RotatingTesseract {
         let elapsed = self.start_time.elapsed().as_secs_f32();
         // 4D rotations through the three w-planes (the star of the show) plus
         // a slow ordinary 3D tumble so the shadow keeps moving on screen.
-        let (axw, ayw, azw) = (elapsed * 0.9, elapsed * 0.6, elapsed * 0.35);
-        let (ax, ay, az) = (elapsed * 0.4, elapsed * 0.7, elapsed * 0.2);
+        let rot = &self.cfg.rotation;
+        let (axw, ayw, azw) = (elapsed * rot.xw, elapsed * rot.yw, elapsed * rot.zw);
+        let (ax, ay, az) = (elapsed * rot.x, elapsed * rot.y, elapsed * rot.z);
 
         // 1. Rotate all sixteen vertices in 4D.
         let mut rot4 = [[0.0f32; 4]; 16];
@@ -1184,13 +1218,14 @@ impl FrameSource for RotatingTesseract {
             *dst = Self::rotate4(*v, axw, ayw, azw);
         }
 
-        // 2. Weak perspective-project 4D -> 3D. The observer sits a good way
-        //    back at w = 4.0, so the far half of the hypercube shrinks and the
-        //    near half enlarges only gently — enough to show the inner/outer
-        //    cells sliding apart without the whole shape lunging at the camera.
+        // 2. Weak perspective-project 4D -> 3D. The observer sits back at
+        //    `perspective`, so the far half of the hypercube shrinks and the near
+        //    half enlarges gently — enough to show the inner/outer cells sliding
+        //    apart without the whole shape lunging at the camera.
         let mut p3 = [[0.0f32; 3]; 16];
+        let dist = self.cfg.perspective;
         for (dst, v) in p3.iter_mut().zip(rot4.iter()) {
-            *dst = Self::project4(*v, 4.0);
+            *dst = Self::project4(*v, dist);
         }
 
         // 3. Ordinary 3D rotation for extra motion.
@@ -1202,10 +1237,8 @@ impl FrameSource for RotatingTesseract {
         // 4. Map to grid with a *fixed* pixels-per-unit scale so the tesseract
         //    keeps a steady size and rotates in place. We never re-fit to the
         //    momentary extent each frame — that used to make the shape snap
-        //    larger/smaller and appear to fling toward the camera. The factor
-        //    below is sized for a world extent of ~2.8 units and keeps the
-        //    shape smaller than the old cube.
-        let units_px = (width as f32).min(height as f32) * 0.12; // px per world unit
+        //    larger/smaller and appear to fling toward the camera.
+        let units_px = (width as f32).min(height as f32) * self.cfg.scale; // px per world unit
         let kx = units_px / self.char_width; // cols per world unit
         let ky = units_px / self.char_height; // rows per world unit
         let cols_c = (self.grid_cols - 1) as f32 / 2.0;
@@ -1222,9 +1255,7 @@ impl FrameSource for RotatingTesseract {
         for (k, e) in EDGES.iter().enumerate() {
             depths[k] = (pts3[e[0]][2] + pts3[e[1]][2]) * 0.5;
         }
-        let dmin = depths.iter().fold(f32::INFINITY, |m, &x| m.min(x));
-        let dmax = depths.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
-        let span = (dmax - dmin).max(1e-6);
+        let depth = DepthRange::new(&depths);
 
         // The cell grid is kept between frames to avoid reallocating it, so it
         // has to be wiped here: every cell lit by the *previous* frame's edges
@@ -1246,17 +1277,18 @@ impl FrameSource for RotatingTesseract {
         });
 
         let cols = self.grid_cols;
+        let ramp_len = self.ramp.len();
         for &k in order.iter() {
             let e = EDGES[k as usize];
             Self::draw_line(
                 &mut self.grid,
                 cols,
+                ramp_len,
                 grid_pts[e[0]],
                 grid_pts[e[1]],
                 pts3[e[0]][2],
                 pts3[e[1]][2],
-                dmin,
-                span,
+                depth,
             );
         }
 
@@ -1268,10 +1300,10 @@ impl FrameSource for RotatingTesseract {
                 &mut self.grid,
                 cols,
                 self.grid_rows,
+                self.vertex_index,
                 *p,
                 pts3[i][2],
-                dmin,
-                span,
+                depth,
             );
         }
 
@@ -1297,7 +1329,10 @@ impl FrameSource for RotatingTesseract {
         let cell_h = self.char_height;
         let ox = self.offset_x;
         let oy = self.offset_y;
+        // The tesseract is always drawn at the nominal font size, so its
+        // baseline shift is just the ascent.
         let ascent = self.ascent;
+        let tess_color = self.cfg.tesseract_color;
         for (idx, cell) in self.grid.iter().enumerate() {
             let Some((gi, bright)) = *cell else { continue };
             let Some(g) = ramp_glyphs.get(gi as usize) else {
@@ -1314,8 +1349,7 @@ impl FrameSource for RotatingTesseract {
                 ox + col as f32 * cell_w,
                 oy + row as f32 * cell_h,
                 ascent,
-                TESSERACT_FONT_SIZE,
-                Self::pack(TESSERACT_COLOR, bright),
+                Self::pack(tess_color, bright),
             );
         }
 
@@ -1341,7 +1375,7 @@ mod tests {
     /// (~900 cells at 1080p, versus ~150-300 for a clean frame).
     #[test]
     fn tesseract_cell_grid_is_reset_every_frame() {
-        let mut s = RotatingTesseract::new(None, None, 0, PowerSaveConfig::default());
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
         s.init(1920, 1080);
         if s.font.is_none() {
             // No system font in this environment; nothing to render.
@@ -1389,7 +1423,8 @@ mod tests {
     /// paces the redraw loop to exactly that many frames per second.
     #[test]
     fn tick_interval_honours_fps_cap() {
-        let mut capped = RotatingTesseract::new(None, None, 60, PowerSaveConfig::default());
+        let mut capped =
+            RotatingTesseract::new(Cube3dConfig::default(), 60, PowerSaveConfig::default());
         capped.init(640, 480);
         if capped.font.is_none() {
             // No system font in this environment; nothing to pace.
@@ -1400,7 +1435,8 @@ mod tests {
             Some(Duration::from_secs_f64(1.0 / 60.0))
         );
 
-        let mut uncapped = RotatingTesseract::new(None, None, 0, PowerSaveConfig::default());
+        let mut uncapped =
+            RotatingTesseract::new(Cube3dConfig::default(), 0, PowerSaveConfig::default());
         uncapped.init(640, 480);
         assert_eq!(uncapped.tick_interval(), Some(Duration::from_micros(6000)));
     }
@@ -1415,7 +1451,7 @@ mod tests {
             fps_cap: 30,
             rain_divisor: 4,
         };
-        let mut s = RotatingTesseract::new(None, None, 60, ps);
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60, ps);
         s.init(640, 480);
         if s.font.is_none() {
             return;
@@ -1439,7 +1475,7 @@ mod tests {
             fps_cap: 0,
             rain_divisor: 4,
         };
-        let mut s = RotatingTesseract::new(None, None, 60, ps);
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60, ps);
         s.init(640, 480);
         if s.font.is_none() {
             return;
@@ -1457,7 +1493,7 @@ mod tests {
             fps_cap: 30,
             rain_divisor: 4,
         };
-        let mut s = RotatingTesseract::new(None, None, 60, ps);
+        let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60, ps);
 
         // On mains: everything.
         s.set_power_saving(false);
@@ -1485,7 +1521,7 @@ mod tests {
                 fps_cap: 30,
                 rain_divisor: divisor,
             };
-            let mut s = RotatingTesseract::new(None, None, 60, ps);
+            let mut s = RotatingTesseract::new(Cube3dConfig::default(), 60, ps);
             s.set_power_saving(true);
             assert!(
                 (0..32).all(|i| s.rain_wall_drawn(i)),
