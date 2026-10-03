@@ -16,6 +16,8 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 struct Args {
+    /// Which output (monitor) to attach to. Defaults to the leftmost one, which
+    /// is the same screen `rustwall` picks.
     #[arg(long)]
     monitor: Option<String>,
     #[arg(long, default_value_t = 32)]

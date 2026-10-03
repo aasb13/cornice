@@ -22,8 +22,8 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "rustwall", about = "A minimal Wayland wallpaper platform")]
 struct Args {
-    /// Which output (monitor) to attach to. Defaults to the last one the
-    /// compositor reports.
+    /// Which output (monitor) to attach to. Defaults to the leftmost one, which
+    /// is the same screen `rustbar` picks.
     #[arg(long)]
     monitor: Option<String>,
 

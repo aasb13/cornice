@@ -93,6 +93,38 @@ fn run_sync(cmd: &str, args: &[&str]) {
     }
 }
 
+/// Index of the output to use when `monitor` is `None`.
+///
+/// Kept identical to the same function in `rustwall`, down to the tests. It used
+/// to pick `outputs.first()` where rustwall picked `outputs.last()`, which on a
+/// two-monitor machine could put the bar on a different screen from the wallpaper
+/// — and in an order that isn't specified, since `OutputState::outputs` is in
+/// registry-advertisement order and can change across a hotplug or restart.
+///
+/// Leftmost by geometry, then name, is a heuristic rather than a primary-output
+/// query (core Wayland has none), but it is the same screen every run and the
+/// same screen rustwall picks. If the compositor withholds geometry — every
+/// location reported as `(0, 0)` — the name breaks the tie.
+fn leftmost(outputs: &[(Option<String>, (i32, i32))]) -> Option<usize> {
+    outputs
+        .iter()
+        .enumerate()
+        // `is_none` sorts false first, so a named output beats an unnamed one at
+        // the same position: it is the one `--monitor` can refer to.
+        .min_by_key(|(_, (name, (x, y)))| (*x, *y, name.is_none(), name.clone()))
+        .map(|(i, _)| i)
+}
+
+/// Every output name, for an error message that says what *was* available.
+fn names(outputs: &[(Option<String>, (i32, i32))]) -> Vec<&str> {
+    outputs
+        .iter()
+        .map(|(n, _)| n.as_deref().unwrap_or("(unnamed)"))
+        .collect()
+}
+
+/// Claim `monitor` (or, if `None`, the leftmost output — see [`leftmost`]) and
+/// render the bar into a `wlr-layer-shell` surface on it. Blocks forever.
 pub fn run(
     monitor: Option<String>,
     bar_height: u32,
@@ -156,20 +188,33 @@ pub fn run(
         bail!("no Wayland outputs found");
     }
 
-    let target = match &monitor {
-        Some(name) => outputs
+    // (name, topleft) for each output, for ordering and for matching --monitor.
+    let described: Vec<(Option<String>, (i32, i32))> = outputs
+        .iter()
+        .map(|o| match app.output_state.info(o) {
+            Some(info) => (info.name, info.location),
+            // No info yet: treat it as unnamed at the origin rather than dropping
+            // it, so a compositor that hasn't described an output doesn't make it
+            // invisible.
+            None => (None, (0, 0)),
+        })
+        .collect();
+
+    let chosen = match &monitor {
+        Some(name) => described
             .iter()
-            .find(|o| {
-                app.output_state
-                    .info(o)
-                    .and_then(|info| info.name)
-                    .as_deref()
-                    == Some(name.as_str())
-            })
-            .cloned()
-            .ok_or_else(|| anyhow!("monitor '{name}' not found"))?,
-        None => outputs.first().cloned().expect("checked non-empty above"),
+            .position(|(n, _)| n.as_deref() == Some(name.as_str()))
+            .ok_or_else(|| anyhow!("monitor '{name}' not found among {:?}", names(&described)))?,
+        None => {
+            let i = leftmost(&described).expect("checked non-empty above");
+            log::info!(
+                "no monitor specified, using {:?}",
+                described[i].0.as_deref().unwrap_or("(unnamed)")
+            );
+            i
+        }
     };
+    let target = outputs[chosen].clone();
 
     let surface = app.compositor_state.create_surface(&qh);
     let layer = app.layer_shell.create_layer_surface(
@@ -976,5 +1021,89 @@ impl Dispatch<ZxdgDecorationManagerV1, GlobalData> for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of the rule: a stable answer, and the leftmost screen, so
+    /// the bar lands where the wallpaper does. Reordering the inputs must not
+    /// change *which output* is chosen — that is the property registry order
+    /// fails to give, and comparing names rather than indices is what proves it.
+    #[test]
+    fn the_bar_output_is_the_leftmost_and_does_not_depend_on_order() {
+        let names_and_geometry = [("DP-2", (1920, 0)), ("eDP-1", (0, 0)), ("DP-1", (0, 1080))];
+        let chosen = |order: &[usize]| {
+            let outputs: Vec<_> = order
+                .iter()
+                .map(|&i| {
+                    let (name, at) = names_and_geometry[i];
+                    (Some(name.to_string()), at)
+                })
+                .collect();
+            let i = leftmost(&outputs).expect("non-empty");
+            names_and_geometry[order[i]].0
+        };
+
+        assert_eq!(
+            chosen(&[0, 1, 2]),
+            "eDP-1",
+            "leftmost is the one at x=0,y=0"
+        );
+        for order in [[2, 1, 0], [1, 2, 0], [2, 0, 1], [1, 0, 2], [0, 2, 1]] {
+            assert_eq!(
+                chosen(&order),
+                "eDP-1",
+                "reordering changed the answer: {order:?}"
+            );
+        }
+    }
+
+    /// Column before row, which is what makes this "leftmost" and not "topmost": a
+    /// monitor stacked *below* the origin beats one off to the right, because x
+    /// is compared first even though its y is much larger.
+    #[test]
+    fn x_is_compared_before_y() {
+        let outputs = vec![
+            (Some("below".to_string()), (0, 1080)),
+            (Some("right".to_string()), (1920, 0)),
+        ];
+        assert_eq!(leftmost(&outputs), Some(0));
+    }
+
+    /// Two outputs at the same spot can't happen in practice, but the compositor
+    /// is allowed to report every location as (0,0). The name has to break that
+    /// tie or the choice falls back to registry order again.
+    #[test]
+    fn a_compositor_that_withholds_geometry_still_picks_deterministically() {
+        let outputs = vec![
+            (Some("DP-1".to_string()), (0, 0)),
+            (Some("eDP-1".to_string()), (0, 0)),
+        ];
+        assert_eq!(leftmost(&outputs), Some(0), "names break the 0,0 tie");
+        let mut reversed = outputs.clone();
+        reversed.reverse();
+        assert_eq!(leftmost(&reversed), Some(1));
+    }
+
+    /// An unnamed output still has to be usable — it's just beaten by a named one
+    /// at the same position, since `--monitor` can't refer to it.
+    #[test]
+    fn an_unnamed_output_is_still_a_candidate() {
+        assert_eq!(leftmost(&[]), None);
+        assert_eq!(leftmost(&[(None, (500, 0))]), Some(0));
+        let named = Some("HDMI-1".to_string());
+        let outputs = vec![(None, (500, 0)), (named, (500, 0))];
+        assert_eq!(leftmost(&outputs), Some(1));
+    }
+
+    /// The error has to say what was available, or the user has no way to find
+    /// the right name to pass.
+    #[test]
+    fn the_error_lists_the_names_that_exist() {
+        let outputs = vec![(Some("DP-1".to_string()), (0, 0)), (None, (1920, 0))];
+        assert_eq!(names(&outputs), vec!["DP-1", "(unnamed)"]);
     }
 }
