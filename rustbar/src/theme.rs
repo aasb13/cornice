@@ -767,6 +767,45 @@ mod module_rendering {
         );
     }
 
+    /// Loud/quiet alternating bands is the worst case for a 14-sample plot 9px
+    /// apart: drawn raw, every other band is a full-height step and the trace
+    /// reads as a zigzag. Blending each band with its neighbours is what turns
+    /// it into one curve, and the geometry tests above can't see it — they pass
+    /// just as well on a zigzag.
+    #[test]
+    fn a_spiky_frame_draws_one_smooth_curve() {
+        let mut canvas = blank();
+        let mut cava = Cava::new();
+        cava.set_frame(
+            &(0..14)
+                .map(|i| if i % 2 == 0 { 90 } else { 8 })
+                .collect::<Vec<u8>>(),
+        );
+        // Enough renders for the envelope to reach the frame.
+        for _ in 0..40 {
+            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+        }
+        let px = canvas.as_chunks::<4>().0;
+        let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
+        let left = 200 + 1;
+        // A peak tick stands on each band's own column, 2px wide, well above the
+        // curve; between them is the trace itself.
+        let tops: Vec<u32> = (left + 9..left + 108)
+            .filter(|x| (x - left) % 9 >= 2)
+            .filter_map(|x| (1..H - 1).find(|&y| painted(x, y)))
+            .collect();
+        assert!(
+            tops.len() > 50,
+            "the trace is missing most of its columns: only {} of them drew",
+            tops.len()
+        );
+        let (lo, hi) = (*tops.iter().min().unwrap(), *tops.iter().max().unwrap());
+        assert!(
+            hi - lo <= 2,
+            "the trace still steps between its spikes: rows {lo}..{hi}"
+        );
+    }
+
     /// The palette used to be a process global, so a module could have kept
     /// reading it instead of the one it was handed and every test would still
     /// pass. Rendering the same module with two palettes must therefore produce

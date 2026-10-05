@@ -129,6 +129,10 @@ pub struct Cava {
     /// over the raw measurement, and a frame that arrives while the bar is
     /// behind should not be integrated twice.
     envelope: Vec<f32>,
+    /// The envelope after one cross-band pass, 0..=1 — what the trace is drawn
+    /// from. Kept beside `envelope` so smoothing the line does not also smooth
+    /// the peak-hold or slow the follower down.
+    smooth: Vec<f32>,
     /// Per-band peak hold, 0..=1, decaying toward the live envelope each frame.
     peaks: Vec<f32>,
 }
@@ -142,6 +146,7 @@ impl Cava {
             layout: (0, 0),
             paused: false,
             envelope: vec![0.0; BARS],
+            smooth: vec![0.0; BARS],
             peaks: vec![0.0; BARS],
         }
     }
@@ -226,6 +231,25 @@ impl Cava {
                 (self.peaks[i] - PEAK_FALL).max(next)
             };
         }
+        // What gets drawn is the envelope blended with its neighbours. 14 bands
+        // 9px apart is coarse enough that a jump between neighbours arrives as a
+        // hard corner in the line, and a row of corners is what reads as a
+        // jagged graph rather than a curve. One 3-tap binomial pass rounds them
+        // off; it is a filter across space, so nothing here responds more slowly
+        // than the envelope above.
+        //
+        // The end bands get a renormalised 2-tap ([2,1] and [1,2] over 3) because
+        // a clamped neighbour would count the band's own value twice and leave a
+        // permanent step at each edge of the plot.
+        for i in 0..BARS {
+            self.smooth[i] = if i == 0 {
+                (2.0 * self.envelope[0] + self.envelope[1]) / 3.0
+            } else if i == BARS - 1 {
+                (self.envelope[BARS - 2] + 2.0 * self.envelope[BARS - 1]) / 3.0
+            } else {
+                (self.envelope[i - 1] + 2.0 * self.envelope[i] + self.envelope[i + 1]) * 0.25
+            };
+        }
     }
 
     /// Render the `#cava` box (background fill + 1px accent border, 8px
@@ -300,18 +324,20 @@ impl Cava {
             ((baseline - 1) as f32 - v.clamp(0.0, 1.0) * span).round() as i32
         };
 
-        // Area wash under the trace, one column per pixel: each column is filled
-        // from the trace down to the baseline with a colour that fades toward the
-        // background as it descends. Walking the *curve* per column rather than
-        // the bands keeps the fill continuous under a steep segment, which is
-        // most of what sells it as a trace rather than 14 separate columns.
-        for px in 0..PLOT_W {
-            let t = px as f32 / PITCH as f32;
-            let i = (t.floor() as usize).min(BARS - 2);
-            let frac = t - i as f32;
-            let v = self.envelope[i] + (self.envelope[i + 1] - self.envelope[i]) * frac;
-            let y = y_at(v);
-            let col = x0 + px;
+        // The trace, one value per pixel column. Straight lines between bands put
+        // a corner at every vertex, and across 118px that reads as a zigzag;
+        // sampling a curve through the smoothed bands instead gives the line a
+        // continuous slope. `ys` is the single source of truth for both the wash
+        // and the stroke, which is what keeps the fill and the line agreeing.
+        let ys: Vec<i32> = (0..PLOT_W)
+            .map(|px| y_at(sample(&self.smooth, px as f32 / PITCH as f32)))
+            .collect();
+
+        // Area wash under the trace: each column is filled from the trace down
+        // to the baseline with a colour that fades toward the background as it
+        // descends.
+        for (px, &y) in ys.iter().enumerate() {
+            let col = x0 + px as u32;
             for row in y.max(top as i32)..baseline as i32 {
                 // Brightest just under the curve, gone by the baseline.
                 let depth = (row - y) as f32 / plot_h.max(1) as f32;
@@ -341,18 +367,19 @@ impl Cava {
             fill_rect(canvas, stride, x, y as u32, PEAK_W, 1, tick, 255);
         }
 
-        // The trace itself: one 1px stroke vertex-to-vertex.
-        for i in 1..BARS {
-            let (xa, ya) = (x0 + (i as u32 - 1) * PITCH, y_at(self.envelope[i - 1]));
-            let (xb, yb) = (x0 + i as u32 * PITCH, y_at(self.envelope[i]));
+        // The trace itself: a 1px stroke column to column. Drawn as one-pixel
+        // steps so a column that drops several rows at once stays connected
+        // instead of leaving a gap in the line.
+        for px in 1..PLOT_W as usize {
+            let (a, b) = (x0 + px as u32 - 1, x0 + px as u32);
             draw_line(
                 canvas,
                 stride,
                 (surface_w, height),
-                xa as i32,
-                ya,
-                xb as i32,
-                yb,
+                a as i32,
+                ys[px - 1],
+                b as i32,
+                ys[px],
                 stroke,
             );
         }
@@ -399,6 +426,28 @@ impl Drop for Cava {
             let _ = std::fs::remove_file(&self.config_path);
         }
     }
+}
+
+/// The smoothed band values as a continuous curve, sampled at fractional band
+/// `t`. A Catmull-Rom through the neighbours, so the line's slope carries from
+/// one column into the next instead of kinking at every vertex; the end tangents
+/// come from clamped neighbours, which keeps the curve on the first and last
+/// band so it still meets the edges of the box.
+fn sample(bands: &[f32], t: f32) -> f32 {
+    let last = bands.len() - 1;
+    let i = (t.floor().max(0.0) as usize).min(last - 1);
+    let f = t - i as f32;
+    let at = |k: isize| bands[k.clamp(0, last as isize) as usize];
+    let (p0, p1, p2, p3) = (
+        at(i as isize - 1),
+        at(i as isize),
+        at(i as isize + 1),
+        at(i as isize + 2),
+    );
+    0.5 * (2.0 * p1
+        + (-p0 + p2) * f
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * f * f
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * f * f * f)
 }
 
 /// Reads cava's raw ASCII stdout on a dedicated thread. Each complete line
