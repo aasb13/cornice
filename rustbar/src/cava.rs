@@ -133,7 +133,8 @@ pub struct Cava {
     /// from. Kept beside `envelope` so smoothing the line does not also smooth
     /// the peak-hold or slow the follower down.
     smooth: Vec<f32>,
-    /// Per-band peak hold, 0..=1, decaying toward the live envelope each frame.
+    /// Per-band peak hold, 0..=1, decaying toward the displayed (smoothed)
+    /// value each frame.
     peaks: Vec<f32>,
 }
 
@@ -221,15 +222,7 @@ impl Cava {
             let target = f32::from(raw) / f32::from(ASCII_MAX);
             let cur = self.envelope[i];
             let k = if target > cur { ATTACK } else { RELEASE };
-            let next = cur + (target - cur) * k;
-            self.envelope[i] = next;
-            // A held peak ratchets up instantly and falls at its own rate; it is
-            // not pulled toward the envelope, or it would just shadow it.
-            self.peaks[i] = if next >= self.peaks[i] {
-                next
-            } else {
-                (self.peaks[i] - PEAK_FALL).max(next)
-            };
+            self.envelope[i] = cur + (target - cur) * k;
         }
         // What gets drawn is the envelope blended with its neighbours. 14 bands
         // 9px apart is coarse enough that a jump between neighbours arrives as a
@@ -248,6 +241,19 @@ impl Cava {
                 (self.envelope[BARS - 2] + 2.0 * self.envelope[BARS - 1]) / 3.0
             } else {
                 (self.envelope[i - 1] + 2.0 * self.envelope[i] + self.envelope[i + 1]) * 0.25
+            };
+        }
+        // The peak hold tracks the *displayed* (smoothed) value, not the raw
+        // envelope. The trace is drawn from `smooth`, so a peak held from the
+        // envelope sits several rows above the line even at steady state and
+        // reads as a random floating pixel rather than a marker on the curve.
+        for (i, &s) in self.smooth.iter().enumerate() {
+            // A held peak ratchets up instantly and falls at its own rate; it is
+            // not pulled toward the signal, or it would just shadow it.
+            self.peaks[i] = if s >= self.peaks[i] {
+                s
+            } else {
+                (self.peaks[i] - PEAK_FALL).max(s)
             };
         }
     }
@@ -364,7 +370,13 @@ impl Cava {
                 continue;
             }
             let x = x0 + i as u32 * PITCH;
-            fill_rect(canvas, stride, x, y as u32, PEAK_W, 1, tick, 255);
+            // The last band's tick would otherwise spill one column past the
+            // plot onto the box's right border.
+            let w = (x0 + PLOT_W).saturating_sub(x).min(PEAK_W);
+            if w == 0 {
+                continue;
+            }
+            fill_rect(canvas, stride, x, y as u32, w, 1, tick, 255);
         }
 
         // The trace itself: a 1px stroke column to column. Drawn as one-pixel

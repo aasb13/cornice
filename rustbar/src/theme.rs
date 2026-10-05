@@ -788,8 +788,8 @@ mod module_rendering {
         let px = canvas.as_chunks::<4>().0;
         let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
         let left = 200 + 1;
-        // A peak tick stands on each band's own column, 2px wide, well above the
-        // curve; between them is the trace itself.
+        // Between the bands is the trace itself; the band columns carry the
+        // peak ticks too, filtered out here so this measures only the curve.
         let tops: Vec<u32> = (left + 9..left + 108)
             .filter(|x| (x - left) % 9 >= 2)
             .filter_map(|x| (1..H - 1).find(|&y| painted(x, y)))
@@ -803,6 +803,44 @@ mod module_rendering {
         assert!(
             hi - lo <= 2,
             "the trace still steps between its spikes: rows {lo}..{hi}"
+        );
+    }
+
+    /// The peak hold tracks the displayed curve, so at steady state every tick
+    /// sits on the trace rather than floating above it. The hold used to track
+    /// the raw envelope while the trace drew the smoothed one, so on a spiky
+    /// frame each loud band's tick hovered ~10 rows above the line like a
+    /// random detached pixel.
+    #[test]
+    fn steady_peaks_sit_on_the_trace_not_above_it() {
+        let mut canvas = blank();
+        let mut cava = Cava::new();
+        cava.set_frame(
+            &(0..14)
+                .map(|i| if i % 2 == 0 { 90 } else { 8 })
+                .collect::<Vec<u8>>(),
+        );
+        // Enough renders for the envelope — and the peak hold — to settle.
+        for _ in 0..40 {
+            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+        }
+        let px = canvas.as_chunks::<4>().0;
+        let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
+        let left = 200 + 1;
+        // Every column this time, band centres included: at steady state the
+        // ticks have nowhere to be but on the line.
+        let tops: Vec<u32> = (left + 9..left + 108)
+            .filter_map(|x| (1..H - 1).find(|&y| painted(x, y)))
+            .collect();
+        assert!(
+            tops.len() > 50,
+            "the trace is missing most of its columns: only {} of them drew",
+            tops.len()
+        );
+        let (lo, hi) = (*tops.iter().min().unwrap(), *tops.iter().max().unwrap());
+        assert!(
+            hi - lo <= 2,
+            "peaks float above the trace: rows {lo}..{hi}"
         );
     }
 
