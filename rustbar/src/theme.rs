@@ -594,7 +594,7 @@ mod module_rendering {
     use super::*;
     use crate::cava::Cava;
     use crate::clock::Clock;
-    use crate::config::{Color, Colors};
+    use crate::config::{CavaMode, Color, Colors};
     use crate::workspaces::WorkspaceList;
 
     const W: u32 = 1280;
@@ -680,7 +680,7 @@ mod module_rendering {
         // in for a running bar.
         cava.set_frame(&(0..14).map(|i| i * 8).collect::<Vec<u8>>());
         for _ in 0..20 {
-            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+            cava.render(&palette(), crate::config::CavaMode::Graph, &mut canvas, 200, H, W * 4);
         }
         assert!(ink(&canvas) > 100, "the visualiser drew almost nothing");
         assert_boxed_in(&canvas, 200, cava.width());
@@ -722,7 +722,7 @@ mod module_rendering {
         // Full scale, so every band draws and the extreme columns are painted.
         cava.set_frame(&[100; 14]);
         for _ in 0..40 {
-            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+            cava.render(&palette(), crate::config::CavaMode::Graph, &mut canvas, 200, H, W * 4);
         }
         let px = canvas.as_chunks::<4>().0;
         let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
@@ -752,7 +752,7 @@ mod module_rendering {
         let mut canvas = blank();
         let mut cava = Cava::new();
         for _ in 0..5 {
-            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+            cava.render(&palette(), crate::config::CavaMode::Graph, &mut canvas, 200, H, W * 4);
         }
         let px = canvas.as_chunks::<4>().0;
         let left = 200 + 1;
@@ -783,7 +783,7 @@ mod module_rendering {
         );
         // Enough renders for the envelope to reach the frame.
         for _ in 0..40 {
-            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+            cava.render(&palette(), crate::config::CavaMode::Graph, &mut canvas, 200, H, W * 4);
         }
         let px = canvas.as_chunks::<4>().0;
         let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
@@ -822,7 +822,7 @@ mod module_rendering {
         );
         // Enough renders for the envelope — and the peak hold — to settle.
         for _ in 0..40 {
-            cava.render(&palette(), &mut canvas, 200, H, W * 4);
+            cava.render(&palette(), crate::config::CavaMode::Graph, &mut canvas, 200, H, W * 4);
         }
         let px = canvas.as_chunks::<4>().0;
         let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
@@ -842,6 +842,38 @@ mod module_rendering {
             hi - lo <= 2,
             "peaks float above the trace: rows {lo}..{hi}"
         );
+    }
+
+    /// The `[cava] mode = "bars"` path draws a solid bar per band, rising from
+    /// the baseline and — unlike the graph — leaving no stray pixels above a
+    /// fallen bar. Every band's column must reach the baseline after a loud
+    /// frame so the bars read as connected to the box.
+    #[test]
+    fn bars_mode_draws_a_bar_per_band_to_the_baseline() {
+        let mut canvas = blank();
+        let mut cava = Cava::new();
+        cava.set_frame(&(0..14).map(|i| 40 + i * 4).collect::<Vec<u8>>());
+        for _ in 0..10 {
+            cava.render(&palette(), CavaMode::Bars, &mut canvas, 200, H, W * 4);
+        }
+        let px = canvas.as_chunks::<4>().0;
+        let painted = |x: u32, y: u32| px[(y * W + x) as usize][..3] != [0, 0, 0];
+        let left = 200 + 1;
+        let (bars_x0, bar_slot, bar_w) = crate::cava::bar_geometry();
+        for i in 0..14 {
+            let x = left + bars_x0 + i as u32 * bar_slot + bar_w / 2;
+            assert!(
+                (1..H - 1).any(|y| painted(x, y)),
+                "band {i} drew nothing"
+            );
+            // Each bar must reach down to the baseline; a gap between the bar's
+            // foot and the baseline rule would look like a floating block.
+            let bottom = (1..H - 1).filter(|&y| painted(x, y)).last().unwrap();
+            assert!(
+                (H - 4..H - 1).contains(&bottom),
+                "band {i} bar stops at row {bottom}, short of the baseline"
+            );
+        }
     }
 
     /// The palette used to be a process global, so a module could have kept
@@ -878,9 +910,9 @@ mod module_rendering {
         assert_ne!(loud_ws, quiet_ws, "the workspaces ignored the palette");
 
         let mut loud_cava = blank();
-        Cava::new().render(&loud, &mut loud_cava, 200, H, W * 4);
+        Cava::new().render(&loud, crate::config::CavaMode::Graph, &mut loud_cava, 200, H, W * 4);
         let mut quiet_cava = blank();
-        Cava::new().render(&quiet, &mut quiet_cava, 200, H, W * 4);
+        Cava::new().render(&quiet, crate::config::CavaMode::Graph, &mut quiet_cava, 200, H, W * 4);
         assert_ne!(loud_cava, quiet_cava, "the visualiser ignored the palette");
     }
 }

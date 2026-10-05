@@ -469,7 +469,7 @@ impl App {
         // 6px 0 0 }` right margin) between them.
         let cava_x = SIDE_MARGIN + self.workspaces.width() + 6;
         self.cava
-            .render(colors, canvas, cava_x, height, stride as u32);
+            .render(colors, self.reload.config().cava.mode, canvas, cava_x, height, stride as u32);
         // Right side: the seamless widget strip is rightmost (battery right
         // cap at the inset edge); the tray is rendered to its LEFT with the
         // waybar 14px gap between them.

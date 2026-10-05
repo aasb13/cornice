@@ -1,5 +1,8 @@
-//! Cava audio-visualizer module — an oscilloscope-style **trace** of the live
-//! spectrum, drawn inside the same bordered box every other module draws.
+//! Cava audio-visualizer module — the live spectrum drawn inside the same
+//! bordered box every other module draws, in one of two styles picked by
+//! `[cava] mode`: an oscilloscope-style connected **trace** (`graph`, the
+//! default), or plain per-band **bars** (`bars`) like waybar's `format-icons`
+//! row.
 //!
 //! Waybar links **libcava** in-process: it sets `ascii_range =
 //! format-icons.len() - 1` (== 7), output method = RAW, reads `audio_raw.bars[]`
@@ -46,7 +49,7 @@ use std::thread;
 
 use calloop::channel::Sender;
 
-use crate::config::Colors;
+use crate::config::{CavaMode, Color, Colors};
 use crate::theme::{draw_bordered_box, draw_line, fill_rect};
 
 /// Number of bars (waybar `cava` `bars: 14`) — and so the number of vertices in
@@ -68,21 +71,25 @@ const BORDER: u32 = 1;
 const ATTACK: f32 = 0.55;
 const RELEASE: f32 = 0.14;
 
-/// How far a peak-hold tick falls per rendered frame, as a fraction of full
-/// scale. Frames arrive at the configured 120/s, so this is a ~1.4s fall from
-/// full — long enough to read as "this was the peak a moment ago".
-const PEAK_FALL: f32 = 0.012;
-/// Peak ticks are wider than the 1px trace so they read as markers on it rather
-/// than as part of it.
-const PEAK_W: u32 = 2;
-
 /// Width of the plot area in px: the 13 gaps between 14 vertices at [`PITCH`],
 /// plus the 1px the last vertex's stroke occupies. The plot runs edge to edge
 /// inside the border — the box's 1px rule is the only thing separating the trace
 /// from the modules beside it, which is what the rest of the bar does.
 const PLOT_W: u32 = (BARS as u32 - 1) * PITCH + 1;
 /// Total box width, so [`Self::width`] and the render agree by construction.
+/// Both modes share it, so switching modes never shifts the modules beside it.
 const BOX_W: u32 = 2 * BORDER + PLOT_W;
+/// Bars mode: each band gets an 8px slot (a 6px bar plus a 2px gap), centred
+/// in the plot area. 14 slots take 112 of the 118 columns, leaving 3px of
+/// margin on each side.
+const BAR_SLOT: u32 = 8;
+pub(crate) const BAR_W: u32 = 6;
+const BARS_X0: u32 = (PLOT_W - BARS as u32 * BAR_SLOT) / 2;
+/// Bar layout exposed for tests, which assert bars reach the baseline.
+#[allow(dead_code)]
+pub(crate) fn bar_geometry() -> (u32, u32, u32) {
+    (BARS_X0, BAR_SLOT, BAR_W)
+}
 
 /// Config written to a temp file and passed to `cava -p`. Every value mirrors the
 /// waybar config.jsonc `cava` block; the `[output]` section forces the raw ASCII
@@ -129,13 +136,10 @@ pub struct Cava {
     /// over the raw measurement, and a frame that arrives while the bar is
     /// behind should not be integrated twice.
     envelope: Vec<f32>,
-    /// The envelope after one cross-band pass, 0..=1 — what the trace is drawn
-    /// from. Kept beside `envelope` so smoothing the line does not also smooth
-    /// the peak-hold or slow the follower down.
+    /// The envelope after one cross-band pass, 0..=1 — what the graph trace is
+    /// drawn from. Cross-band blurring would merge neighbouring bars into each
+    /// other, so bars mode reads the envelope directly instead.
     smooth: Vec<f32>,
-    /// Per-band peak hold, 0..=1, decaying toward the displayed (smoothed)
-    /// value each frame.
-    peaks: Vec<f32>,
 }
 
 impl Cava {
@@ -148,7 +152,6 @@ impl Cava {
             paused: false,
             envelope: vec![0.0; BARS],
             smooth: vec![0.0; BARS],
-            peaks: vec![0.0; BARS],
         }
     }
 
@@ -212,10 +215,9 @@ impl Cava {
         self.child = Some(child);
     }
 
-    /// Advance the envelope and peak-hold toward the latest frame. One step per
-    /// render, so the smoothing rate is tied to how often the bar actually
-    /// draws rather than to a wall clock — a dropped frame slows the decay
-    /// instead of jumping it.
+    /// Advance the envelope toward the latest frame. One step per render, so the
+    /// smoothing rate is tied to how often the bar actually draws rather than
+    /// to a wall clock — a dropped frame slows the decay instead of jumping it.
     fn advance(&mut self) {
         let frame = self.bars.lock().unwrap().clone();
         for (i, &raw) in frame.iter().enumerate() {
@@ -243,28 +245,17 @@ impl Cava {
                 (self.envelope[i - 1] + 2.0 * self.envelope[i] + self.envelope[i + 1]) * 0.25
             };
         }
-        // The peak hold tracks the *displayed* (smoothed) value, not the raw
-        // envelope. The trace is drawn from `smooth`, so a peak held from the
-        // envelope sits several rows above the line even at steady state and
-        // reads as a random floating pixel rather than a marker on the curve.
-        for (i, &s) in self.smooth.iter().enumerate() {
-            // A held peak ratchets up instantly and falls at its own rate; it is
-            // not pulled toward the signal, or it would just shadow it.
-            self.peaks[i] = if s >= self.peaks[i] {
-                s
-            } else {
-                (self.peaks[i] - PEAK_FALL).max(s)
-            };
-        }
     }
 
     /// Render the `#cava` box (background fill + 1px accent border, 8px
-    /// h-padding) with the live spectrum drawn inside it as a single connected
-    /// trace: a 1px accent stroke through one vertex per band, a soft gradient
-    /// wash filling down to the baseline under it, and a peak-hold tick per band.
+    /// h-padding) with the live spectrum drawn inside it, either as a single
+    /// connected trace (`mode == Graph`: a 1px accent stroke through one vertex
+    /// per band, with a soft gradient wash filling down to the baseline under
+    /// it) or as plain per-band bars (`mode == Bars`, waybar-style).
     pub fn render(
         &mut self,
         colors: &Colors,
+        mode: CavaMode,
         canvas: &mut [u8],
         x_offset: u32,
         height: u32,
@@ -330,11 +321,46 @@ impl Cava {
             ((baseline - 1) as f32 - v.clamp(0.0, 1.0) * span).round() as i32
         };
 
-        // The trace, one value per pixel column. Straight lines between bands put
-        // a corner at every vertex, and across 118px that reads as a zigzag;
-        // sampling a curve through the smoothed bands instead gives the line a
-        // continuous slope. `ys` is the single source of truth for both the wash
-        // and the stroke, which is what keeps the fill and the line agreeing.
+        match mode {
+            CavaMode::Graph => self.render_graph(
+                colors,
+                stroke,
+                canvas,
+                stride,
+                surface_w,
+                x0,
+                top,
+                baseline,
+                plot_h,
+                height,
+                &y_at,
+            ),
+            CavaMode::Bars => self.render_bars(stroke, canvas, stride, x0, baseline, &y_at),
+        }
+    }
+
+    /// The graph: one value per pixel column sampled as a curve through the
+    /// smoothed bands, a gradient wash under it, and the 1px stroke itself.
+    /// `ys` is the single source of truth for both the wash and the stroke,
+    /// which is what keeps the fill and the line agreeing.
+    #[allow(clippy::too_many_arguments)]
+    fn render_graph(
+        &self,
+        colors: &Colors,
+        stroke: Color,
+        canvas: &mut [u8],
+        stride: u32,
+        surface_w: u32,
+        x0: u32,
+        top: u32,
+        baseline: u32,
+        plot_h: u32,
+        height: u32,
+        y_at: &dyn Fn(f32) -> i32,
+    ) {
+        // Straight lines between bands put a corner at every vertex, and across
+        // 118px that reads as a zigzag; sampling a curve through the smoothed
+        // bands instead gives the line a continuous slope.
         let ys: Vec<i32> = (0..PLOT_W)
             .map(|px| y_at(sample(&self.smooth, px as f32 / PITCH as f32)))
             .collect();
@@ -360,25 +386,6 @@ impl Cava {
             }
         }
 
-        // Peak-hold ticks, before the stroke: a tick sitting exactly on the live
-        // value is redundant, and drawing it last would put a dimmer pixel in
-        // the middle of the brightest line on the bar.
-        let tick = stroke.lerp(colors.background, 0.25);
-        for (i, &peak) in self.peaks.iter().enumerate() {
-            let y = y_at(peak);
-            if y < top as i32 {
-                continue;
-            }
-            let x = x0 + i as u32 * PITCH;
-            // The last band's tick would otherwise spill one column past the
-            // plot onto the box's right border.
-            let w = (x0 + PLOT_W).saturating_sub(x).min(PEAK_W);
-            if w == 0 {
-                continue;
-            }
-            fill_rect(canvas, stride, x, y as u32, w, 1, tick, 255);
-        }
-
         // The trace itself: a 1px stroke column to column. Drawn as one-pixel
         // steps so a column that drops several rows at once stays connected
         // instead of leaving a gap in the line.
@@ -393,6 +400,40 @@ impl Cava {
                 b as i32,
                 ys[px],
                 stroke,
+            );
+        }
+    }
+
+    /// Plain per-band bars, waybar-style: one solid bar per band rising from
+    /// the baseline, read straight from the envelope. Cross-band blurring
+    /// would merge neighbouring bars, so this deliberately skips `smooth`.
+    /// No peak caps — at this scale they detach from fallen bars and read as
+    /// stray pixels rather than markers, which is what they did on the graph.
+    #[allow(clippy::too_many_arguments)]
+    fn render_bars(
+        &self,
+        stroke: Color,
+        canvas: &mut [u8],
+        stride: u32,
+        x0: u32,
+        baseline: u32,
+        y_at: &dyn Fn(f32) -> i32,
+    ) {
+        for (i, &v) in self.envelope.iter().enumerate() {
+            let y = y_at(v);
+            let h = baseline as i32 - y;
+            if h <= 0 {
+                continue;
+            }
+            fill_rect(
+                canvas,
+                stride,
+                x0 + BARS_X0 + i as u32 * BAR_SLOT,
+                y as u32,
+                BAR_W,
+                h as u32,
+                stroke,
+                255,
             );
         }
     }

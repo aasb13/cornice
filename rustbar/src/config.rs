@@ -132,6 +132,10 @@ pub struct Config {
     /// How the config is re-read while running.
     #[serde(default)]
     pub reload: ReloadConfig,
+
+    /// How the cava visualiser draws.
+    #[serde(default)]
+    pub cava: CavaConfig,
 }
 
 impl rwconfig::Config for Config {
@@ -203,6 +207,28 @@ impl Default for Colors {
             inactive: default_inactive(),
         }
     }
+}
+
+/// How the cava visualiser draws its box: the oscilloscope-style connected
+/// trace (`graph`, the default), or plain per-band bars (`bars`) like waybar's
+/// `format-icons` row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CavaMode {
+    /// One connected 1px stroke through a vertex per band, with a gradient
+    /// wash underneath.
+    #[default]
+    Graph,
+    /// One solid vertical bar per band, waybar-style. Same box, same scale.
+    Bars,
+}
+
+/// The `[cava]` table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CavaConfig {
+    #[serde(default)]
+    pub mode: CavaMode,
 }
 
 pub const CONFIG_HEADER: &str = "\
@@ -400,5 +426,22 @@ mod tests {
         fn into_rgb(self) -> Color {
             Color::rgb(self.0, self.1, self.2)
         }
+    }
+
+    #[test]
+    fn cava_defaults_to_graph() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.cava.mode, CavaMode::Graph);
+    }
+
+    #[test]
+    fn cava_mode_is_selectable_and_typo_checked() {
+        let config: Config = toml::from_str("[cava]\nmode = \"bars\"\n").unwrap();
+        assert_eq!(config.cava.mode, CavaMode::Bars);
+        let config: Config = toml::from_str("[cava]\nmode = \"graph\"\n").unwrap();
+        assert_eq!(config.cava.mode, CavaMode::Graph);
+        // An unknown mode fails loudly rather than silently drawing the default.
+        assert!(toml::from_str::<Config>("[cava]\nmode = \"wave\"\n").is_err());
+        assert!(toml::from_str::<Config>("[cava]\nmod = \"bars\"\n").is_err());
     }
 }
