@@ -1,22 +1,22 @@
-//! Configuration for rustbar.
+//! Configuration for cornice-bar.
 //!
-//! The file lives at `~/.config/rustbar/config.toml`, or wherever `--config`
+//! The file lives at `~/.config/cornice-bar/config.toml`, or wherever `--config`
 //! points. If it doesn't exist it is created on first run as a fully
 //! commented-out dump of every option, so the file is always a complete,
-//! self-documenting template for the version of rustbar that wrote it.
+//! self-documenting template for the version of cornice-bar that wrote it.
 //!
 //! Unknown keys are a hard error rather than a silent no-op: a typo in a config
 //! that quietly does nothing is worse than a config that refuses to start.
 //!
 //! What happens *around* the file — finding it, creating it, watching it,
-//! re-reading it, surviving a bad edit — is [`rwconfig`]'s job, not this
-//! module's. What's here is what's specific to rustbar: the palette, and how
+//! re-reading it, surviving a bad edit — is [`cornice_config`]'s job, not this
+//! module's. What's here is what's specific to cornice-bar: the palette, and how
 //! it is parsed.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-pub use rwconfig::ReloadConfig;
+pub use cornice_config::ReloadConfig;
 
 /// An 8-bit RGB colour.
 ///
@@ -138,7 +138,7 @@ pub struct Config {
     pub cava: CavaConfig,
 }
 
-impl rwconfig::Config for Config {
+impl cornice_config::Config for Config {
     /// The palette is validated by parsing — a colour either is a hex string or
     /// fails at deserialization — so the only thing left to check is the reload
     /// table. Declared explicitly rather than left to the default so that a
@@ -232,17 +232,17 @@ pub struct CavaConfig {
 }
 
 pub const CONFIG_HEADER: &str = "\
-# Rustbar configuration
+# Cornice bar configuration
 #
 # Every option is shown with its default value, commented out: uncomment a line
-# to change it. Keys rustbar does not recognise are an error, so a typo fails
+# to change it. Keys cornice-bar does not recognise are an error, so a typo fails
 # loudly instead of being silently ignored.
 ";
 
 /// The commented template a missing config file is created from, and what
 /// `--print-default-config` prints.
 pub fn default_config_text() -> String {
-    rwconfig::commented_template::<Config>(CONFIG_HEADER)
+    cornice_config::commented_template::<Config>(CONFIG_HEADER)
 }
 
 #[cfg(test)]

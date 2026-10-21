@@ -1,18 +1,18 @@
-//! Configuration for rustwall.
+//! Configuration for cornice.
 //!
-//! The file lives at `~/.config/rustwall/config.toml` by default (the XDG
+//! The file lives at `~/.config/cornice/config.toml` by default (the XDG
 //! config directory on Linux), or wherever `--config` points. If it doesn't
 //! exist it is created on first run as a fully commented-out dump of every
 //! option, so the file is always a complete, self-documenting template for the
-//! version of rustwall that wrote it.
+//! version of cornice that wrote it.
 //!
 //! Unknown keys are a hard error rather than a silent no-op: a typo in a
 //! config that quietly does nothing is worse than a config that refuses to
 //! start.
 //!
 //! What happens *around* the file — finding it, creating it, watching it,
-//! re-reading it, surviving a bad edit — is [`rwconfig`]'s job, not this
-//! module's. What's here is what's specific to rustwall: the options, and the
+//! re-reading it, surviving a bad edit — is [`cornice_config`]'s job, not this
+//! module's. What's here is what's specific to cornice: the options, and the
 //! rules about which combinations of them can't be rendered.
 
 mod color;
@@ -20,7 +20,7 @@ pub(crate) mod cube3d;
 
 pub use color::Color;
 pub use cube3d::Cube3dConfig;
-pub use rwconfig::ReloadConfig;
+pub use cornice_config::ReloadConfig;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -86,7 +86,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PowerSaveConfig {
-    /// Master switch. When false, `rustwall` ignores the battery entirely and
+    /// Master switch. When false, `cornice` ignores the battery entirely and
     /// always runs at full speed.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -205,7 +205,7 @@ impl Default for Config {
     }
 }
 
-impl rwconfig::Config for Config {
+impl cornice_config::Config for Config {
     /// Reject a config that parses but can't be rendered from — an unknown
     /// source, inverted ranges, empty glyph sets. All of these would otherwise
     /// surface as a blank wallpaper or a division by zero, hours later, with no
@@ -241,17 +241,17 @@ pub fn ser_float<S: serde::Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error>
 }
 
 pub const CONFIG_HEADER: &str = "\
-# Rustwall configuration
+# Cornice configuration
 #
 # Every option is shown with its default value, commented out: uncomment a line
-# to change it. Keys rustwall does not recognise are an error, so a typo fails
+# to change it. Keys cornice does not recognise are an error, so a typo fails
 # loudly instead of being silently ignored.
 ";
 
 /// The commented template a missing config file is created from, and what
 /// `--print-default-config` prints.
 pub fn default_config_text() -> String {
-    rwconfig::commented_template::<Config>(CONFIG_HEADER)
+    cornice_config::commented_template::<Config>(CONFIG_HEADER)
 }
 
 #[cfg(test)]
@@ -259,7 +259,7 @@ mod tests {
     use super::*;
     // Anonymous import: brings `validate` into scope without colliding with the
     // `Config` struct of the same name.
-    use rwconfig::Config as _;
+    use cornice_config::Config as _;
 
     #[test]
     fn empty_config_uses_defaults() {

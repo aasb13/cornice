@@ -1,5 +1,5 @@
 # =============================================================================
-# .gitignore — rustwall workspace (Rust Wayland compositor + status bar)
+# .gitignore — cornice workspace (Rust Wayland compositor + status bar)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -8,14 +8,14 @@
 # Cargo build artifacts. The workspace shares a single root `target/`; the
 # per-crate entries are kept as a safety net for standalone/non-workspace builds.
 /target
-/rustwall/target
-/rustbar/target
+/cornice/target
+/cornice-bar/target
 
 # Backup files produced by rustfmt / rustc.
 **/*.rs.bk
 
 # NOTE: Cargo.lock is intentionally COMMITTED here because this project ships
-# binary executables (rustwall, rustbar). Do NOT ignore it. (Only libraries
+# binary executables (cornice, cornice-bar). Do NOT ignore it. (Only libraries
 # typically omit Cargo.lock from version control.)
 
 # ---------------------------------------------------------------------------

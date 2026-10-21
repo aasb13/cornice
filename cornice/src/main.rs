@@ -8,26 +8,26 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use std::path::PathBuf;
 
-/// rustwall — a minimal Wayland wallpaper platform.
+/// cornice — a minimal Wayland wallpaper platform.
 ///
 /// This binary does all the Wayland/layer-shell plumbing: claiming a
 /// monitor, opening a `wlr-layer-shell` background surface, managing the
 /// pixel buffer. It renders whatever `source::FrameSource` you give it.
 ///
-/// Everything tunable lives in the config file at `~/.config/rustwall/config.toml`
+/// Everything tunable lives in the config file at `~/.config/cornice/config.toml`
 /// (created on first run as a fully commented template of every option), or
 /// wherever `--config` points. Changes apply without restarting: the file is
-/// watched automatically (see `[reload]`), or `rustwall --reload` tells the
+/// watched automatically (see `[reload]`), or `cornice --reload` tells the
 /// running instance to re-read now.
 #[derive(Parser, Debug)]
-#[command(name = "rustwall", about = "A minimal Wayland wallpaper platform")]
+#[command(name = "cornice", about = "A minimal Wayland wallpaper platform")]
 struct Args {
     /// Which output (monitor) to attach to. Defaults to the leftmost one, which
-    /// is the same screen `rustbar` picks.
+    /// is the same screen `cornice-bar` picks.
     #[arg(long)]
     monitor: Option<String>,
 
-    /// Config file to use instead of `~/.config/rustwall/config.toml`.
+    /// Config file to use instead of `~/.config/cornice/config.toml`.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -40,7 +40,7 @@ struct Args {
     #[arg(long)]
     print_default_config: bool,
 
-    /// Ask any running rustwall to re-read its config, then exit. Works
+    /// Ask any running cornice to re-read its config, then exit. Works
     /// whether or not `[reload] watch` is enabled.
     #[arg(long)]
     reload: bool,
@@ -61,11 +61,11 @@ fn main() -> Result<()> {
     // Before the logger and before touching the config, because this invocation
     // only signals another process and exits — it has no wallpaper to draw.
     if args.reload {
-        let n = rwconfig::signal_siblings()?;
+        let n = cornice_config::signal_siblings()?;
         if n == 0 {
-            bail!("no running rustwall instance found");
+            bail!("no running cornice instance found");
         }
-        println!("asked {n} running rustwall instance(s) to reload");
+        println!("asked {n} running cornice instance(s) to reload");
         return Ok(());
     }
 
@@ -76,13 +76,13 @@ fn main() -> Result<()> {
     // Before anything spawns a thread: every thread must block SIGHUP for the
     // event loop's signalfd to receive `--reload` rather than the kernel
     // delivering it to a worker and killing the process.
-    rwconfig::block_early()?;
+    cornice_config::block_early()?;
 
     // Opens the config, creating a commented template on first run. A config
     // that doesn't parse is fatal here — there is no previous one to fall back
     // to — whereas a bad edit later is logged and ignored.
-    let reload = rwconfig::Reload::<config::Config>::open(
-        "rustwall",
+    let reload = cornice_config::Reload::<config::Config>::open(
+        "cornice",
         config::CONFIG_HEADER,
         args.config.as_deref(),
     )?;

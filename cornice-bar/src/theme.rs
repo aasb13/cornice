@@ -1,6 +1,6 @@
 //! Drawing primitives shared by every bar module.
 //!
-//! The palette itself is not here — it comes from `~/.config/rustbar/config.toml`
+//! The palette itself is not here — it comes from `~/.config/cornice-bar/config.toml`
 //! (see [`crate::config`]) and is handed to every draw as a `&Colors`, so a
 //! colour change is a config edit rather than a recompile, and the live palette
 //! is whatever the reload currently holds. The defaults still match the waybar

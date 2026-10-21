@@ -60,7 +60,7 @@ impl PowerMonitor {
         let on_battery = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&on_battery);
         let poller = std::thread::Builder::new()
-            .name("rustwall-power".to_string())
+            .name("cornice-power".to_string())
             .spawn(move || {
                 loop {
                     flag.store(on_battery_now(), Ordering::Relaxed);
@@ -123,7 +123,7 @@ mod tests {
     /// Build a fake `/sys/class/power_supply` tree: one directory per supply.
     fn fake_supplies(entries: &[(&str, &str, &str)]) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "rustwall-power-test-{}-{:p}",
+            "cornice-power-test-{}-{:p}",
             std::process::id(),
             entries
         ));

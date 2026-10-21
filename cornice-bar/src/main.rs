@@ -17,13 +17,13 @@ use std::path::PathBuf;
 #[derive(Parser)]
 struct Args {
     /// Which output (monitor) to attach to. Defaults to the leftmost one, which
-    /// is the same screen `rustwall` picks.
+    /// is the same screen `cornice` picks.
     #[arg(long)]
     monitor: Option<String>,
     #[arg(long, default_value_t = 32)]
     height: u32,
 
-    /// Config file to use instead of `~/.config/rustbar/config.toml`.
+    /// Config file to use instead of `~/.config/cornice-bar/config.toml`.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
@@ -36,7 +36,7 @@ struct Args {
     #[arg(long)]
     print_default_config: bool,
 
-    /// Ask any running rustbar to re-read its config, then exit. Works whether
+    /// Ask any running cornice-bar to re-read its config, then exit. Works whether
     /// or not `[reload] watch` is enabled.
     #[arg(long)]
     reload: bool,
@@ -53,11 +53,11 @@ fn main() -> Result<()> {
     // Before the logger and before touching the config: this invocation only
     // signals another process and exits, so it has no bar to draw.
     if args.reload {
-        let n = rwconfig::signal_siblings()?;
+        let n = cornice_config::signal_siblings()?;
         if n == 0 {
-            anyhow::bail!("no running rustbar instance found");
+            anyhow::bail!("no running cornice-bar instance found");
         }
-        println!("asked {n} running rustbar instance(s) to reload");
+        println!("asked {n} running cornice-bar instance(s) to reload");
         return Ok(());
     }
 
@@ -67,13 +67,13 @@ fn main() -> Result<()> {
     // event loop's signalfd to receive `--reload` rather than the kernel
     // delivering it to a worker (the cava reader, the tray client) and killing
     // the process.
-    rwconfig::block_early()?;
+    cornice_config::block_early()?;
 
     // Opens the config, creating a commented template on first run. A config
     // that doesn't parse is fatal here — there is no previous one to fall back
     // to — whereas a bad edit later is logged and ignored.
-    let reload = rwconfig::Reload::<config::Config>::open(
-        "rustbar",
+    let reload = cornice_config::Reload::<config::Config>::open(
+        "cornice-bar",
         config::CONFIG_HEADER,
         args.config.as_deref(),
     )?;

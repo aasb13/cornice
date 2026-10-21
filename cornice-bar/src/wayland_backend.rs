@@ -41,7 +41,7 @@ use crate::tray::{self};
 use crate::tray_render::TrayRenderer;
 use crate::widgets::{SegKind, WidgetStrip};
 use crate::workspaces::WorkspaceList;
-use rwconfig::Reload;
+use cornice_config::Reload;
 
 /// Volume scroll step in percent. Matches waybar `pulseaudio`'s default
 /// `scroll-step` (the user's config has no override); volume is capped at 100%
@@ -95,15 +95,15 @@ fn run_sync(cmd: &str, args: &[&str]) {
 
 /// Index of the output to use when `monitor` is `None`.
 ///
-/// Kept identical to the same function in `rustwall`, down to the tests. It used
-/// to pick `outputs.first()` where rustwall picked `outputs.last()`, which on a
+/// Kept identical to the same function in `cornice`, down to the tests. It used
+/// to pick `outputs.first()` where cornice picked `outputs.last()`, which on a
 /// two-monitor machine could put the bar on a different screen from the wallpaper
 /// — and in an order that isn't specified, since `OutputState::outputs` is in
 /// registry-advertisement order and can change across a hotplug or restart.
 ///
 /// Leftmost by geometry, then name, is a heuristic rather than a primary-output
 /// query (core Wayland has none), but it is the same screen every run and the
-/// same screen rustwall picks. If the compositor withholds geometry — every
+/// same screen cornice picks. If the compositor withholds geometry — every
 /// location reported as `(0, 0)` — the name breaks the tie.
 fn leftmost(outputs: &[(Option<String>, (i32, i32))]) -> Option<usize> {
     outputs
@@ -221,7 +221,7 @@ pub fn run(
         &qh,
         surface,
         Layer::Top,
-        Some("rustbar"),
+        Some("cornice-bar"),
         Some(&target),
     );
     layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);

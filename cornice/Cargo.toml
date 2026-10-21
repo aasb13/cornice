@@ -1,5 +1,5 @@
 [package]
-name = "rustwall"
+name = "cornice"
 version = "0.1.0"
 edition = "2024"
 
@@ -11,7 +11,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 env_logger = "0.11.11"
 log = "0.4.33"
 nix = { version = "0.31", features = ["signal", "process"] }
-rwconfig = { path = "../rwconfig" }
+cornice-config = { path = "../cornice-config" }
 rusttype = "0.9.3"
 serde = { version = "1", features = ["derive"] }
 smithay-client-toolkit = "0.20.0"

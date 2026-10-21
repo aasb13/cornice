@@ -624,7 +624,7 @@ mod tests {
     use crate::config::Config;
     // Anonymous import: brings `validate` into scope without colliding with the
     // `Config` struct of the same name.
-    use rwconfig::Config as _;
+    use cornice_config::Config as _;
 
     fn parse(toml_text: &str) -> Config {
         toml::from_str::<Config>(toml_text).unwrap()

@@ -38,14 +38,14 @@ use wayland_client::{
 use crate::config::{Config, PowerSaveConfig, PowerState};
 use crate::power::PowerMonitor;
 use crate::source::FrameSource;
-use rwconfig::Reload;
+use cornice_config::Reload;
 
 /// Index of the output to use when `monitor` is `None`.
 ///
 /// Deterministic on purpose. `OutputState::outputs` is in registry-advertisement
 /// order — whatever order the compositor enumerated its globals in — which is not
 /// specified and can change across a hotplug or a compositor restart. This
-/// previously picked `outputs.last()`, while `rustbar` picked `outputs.first()`,
+/// previously picked `outputs.last()`, while `cornice-bar` picked `outputs.first()`,
 /// so on a two-monitor machine the wallpaper and the bar could silently end up on
 /// different screens. Ordering by geometry (then y, then name) picks the same
 /// screen on every run and the same screen for both programs. Leftmost is the
@@ -173,7 +173,7 @@ pub fn run(
         &qh,
         surface,
         Layer::Background,
-        Some("rustwall"),
+        Some("cornice"),
         Some(&target),
     );
     layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);

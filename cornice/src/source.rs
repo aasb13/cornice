@@ -1,6 +1,6 @@
 //! The extension point.
 //!
-//! `rustwall` itself only knows how to talk to Wayland: claim a monitor,
+//! `cornice` itself only knows how to talk to Wayland: claim a monitor,
 //! open a `wlr-layer-shell` background surface, hand you a pixel buffer.
 //! It has no idea what an image, a video, or an audio visualizer is — and
 //! it doesn't need to. All of that lives in a `FrameSource` implementation
@@ -22,11 +22,11 @@ pub trait FrameSource {
     /// Render one frame.
     ///
     /// `canvas` is exactly `height * stride` bytes: `height` rows of
-    /// `stride` bytes each (`stride == width * 4` — rustwall doesn't add
+    /// `stride` bytes each (`stride == width * 4` — cornice doesn't add
     /// row padding), 4 bytes per pixel, `XRGB8888` (i.e. each pixel is the
     /// four bytes `B, G, R, X` in memory, native/little-endian).
     ///
-    /// Return `true` if you actually drew something new (rustwall will
+    /// Return `true` if you actually drew something new (cornice will
     /// damage the surface and commit it to the compositor). Return `false`
     /// to skip this tick with no commit — cheap for e.g. an audio
     /// visualizer that has nothing new to show yet.
@@ -40,7 +40,7 @@ pub trait FrameSource {
     ///   `duration` (video, cava, a clock, anything that changes on its
     ///   own).
     ///
-    /// rustwall re-reads this after every frame, so a source can change the
+    /// cornice re-reads this after every frame, so a source can change the
     /// answer at runtime — that's how a frame-rate cap follows the display
     /// refresh rate, or drops when the machine goes onto battery.
     fn tick_interval(&self) -> Option<Duration> {

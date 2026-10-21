@@ -1,4 +1,4 @@
-//! Config loading and reloading shared by `rustwall` and `rustbar`.
+//! Config loading and reloading shared by `cornice` and `cornice-bar`.
 //!
 //! Both binaries want the same behaviour from a TOML file in their XDG config
 //! directory, and both get it wrong in the same ways if written twice: the
@@ -134,7 +134,7 @@ mod sighup {
     }
 
     /// Send `SIGHUP` to every other process running the same executable as us,
-    /// so `rustbar --reload` from a shell reaches the bar.
+    /// so `cornice-bar --reload` from a shell reaches the bar.
     ///
     /// Receiving is the caller's job, via calloop's signal source — a polled
     /// flag can't wake an event loop that's blocked in `dispatch`, which is
@@ -188,7 +188,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("rwconfig-test-{}-{name}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("cornice-config-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -322,7 +322,7 @@ mod tests {
             .arg("--nocapture")
             .arg("--exact")
             .arg("tests::sibling_reports_its_pid")
-            .env("RWCONFIG_SIBLING_PIDFILE", &pidfile)
+            .env("CORNICE_SIBLING_PIDFILE", &pidfile)
             .spawn()
             .unwrap();
 
@@ -379,7 +379,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sibling_reports_its_pid() {
-        let Ok(pidfile) = std::env::var("RWCONFIG_SIBLING_PIDFILE") else {
+        let Ok(pidfile) = std::env::var("CORNICE_SIBLING_PIDFILE") else {
             return;
         };
         std::fs::write(pidfile, std::process::id().to_string()).unwrap();

@@ -183,7 +183,7 @@ impl Cava {
         // PID-suffixed temp file — unique per bar instance, cleaned up on drop
         // (no extra crate needed for a secure tempfile).
         let config_path =
-            std::env::temp_dir().join(format!("rustbar-cava-{}.conf", std::process::id()));
+            std::env::temp_dir().join(format!("cornice-bar-cava-{}.conf", std::process::id()));
         if let Err(err) = std::fs::write(&config_path, CAVA_CONFIG) {
             log::error!("cava: failed to write temp config {:?}: {err}", config_path);
             return;

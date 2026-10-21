@@ -332,6 +332,62 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cornice"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "calloop-wayland-source",
+ "clap",
+ "cornice-config",
+ "env_logger",
+ "log",
+ "nix",
+ "rusttype",
+ "serde",
+ "smithay-client-toolkit",
+ "toml",
+ "wayland-client",
+]
+
+[[package]]
+name = "cornice-bar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calloop",
+ "calloop-wayland-source",
+ "chrono",
+ "clap",
+ "cornice-config",
+ "env_logger",
+ "hyprland",
+ "image",
+ "log",
+ "nix",
+ "rusttype",
+ "serde",
+ "smithay-client-toolkit",
+ "system-tray",
+ "tokio",
+ "toml",
+ "wayland-client",
+ "wayland-protocols",
+]
+
+[[package]]
+name = "cornice-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "log",
+ "nix",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1127,31 +1183,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "rustbar"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "calloop",
- "calloop-wayland-source",
- "chrono",
- "clap",
- "env_logger",
- "hyprland",
- "image",
- "log",
- "nix",
- "rusttype",
- "rwconfig",
- "serde",
- "smithay-client-toolkit",
- "system-tray",
- "tokio",
- "toml",
- "wayland-client",
- "wayland-protocols",
-]
-
-[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1188,37 +1219,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "rustwall"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "calloop",
- "calloop-wayland-source",
- "clap",
- "env_logger",
- "log",
- "nix",
- "rusttype",
- "rwconfig",
- "serde",
- "smithay-client-toolkit",
- "toml",
- "wayland-client",
-]
-
-[[package]]
-name = "rwconfig"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs",
- "log",
- "nix",
- "serde",
- "toml",
-]
 
 [[package]]
 name = "scopeguard"
