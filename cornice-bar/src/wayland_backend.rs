@@ -441,7 +441,7 @@ impl App {
             }
         };
 
-        for pixel in canvas.chunks_exact_mut(4) {
+        for pixel in canvas.as_chunks_mut::<4>().0 {
             pixel[0] = 0;
             pixel[1] = 0;
             pixel[2] = 0;
@@ -468,8 +468,14 @@ impl App {
         // after workspaces with the waybar 6px gap (`#workspaces { margin: 0
         // 6px 0 0 }` right margin) between them.
         let cava_x = SIDE_MARGIN + self.workspaces.width() + 6;
-        self.cava
-            .render(colors, self.reload.config().cava.mode, canvas, cava_x, height, stride as u32);
+        self.cava.render(
+            colors,
+            self.reload.config().cava.mode,
+            canvas,
+            cava_x,
+            height,
+            stride as u32,
+        );
         // Right side: the seamless widget strip is rightmost (battery right
         // cap at the inset edge); the tray is rendered to its LEFT with the
         // waybar 14px gap between them.
@@ -709,11 +715,11 @@ impl PointerHandler for App {
             let on_bar = self
                 .layer
                 .as_ref()
-                .map_or(false, |l| l.wl_surface() == &event.surface);
+                .is_some_and(|l| l.wl_surface() == &event.surface);
             let on_menu = self
                 .menu
                 .as_ref()
-                .map_or(false, |m| m.wl_surface() == &event.surface);
+                .is_some_and(|m| m.wl_surface() == &event.surface);
 
             if on_menu {
                 match event.kind {
@@ -727,14 +733,13 @@ impl PointerHandler for App {
                             let _ = tp.set_cursor(conn, CursorIcon::Pointer);
                         }
                     }
-                    PointerEventKind::Press { button, .. } if button == 0x110 => {
+                    PointerEventKind::Press { button: 0x110, .. } => {
                         let (_x, y) = event.position;
-                        if let Some(menu) = &self.menu {
-                            if let Some(item_id) = menu.hit_test(y) {
-                                if let Some(tray) = &self.tray {
-                                    tray.click_menu_item(&menu.owner_id, &menu.menu_path, item_id);
-                                }
-                            }
+                        if let Some(menu) = &self.menu
+                            && let Some(item_id) = menu.hit_test(y)
+                            && let Some(tray) = &self.tray
+                        {
+                            tray.click_menu_item(&menu.owner_id, &menu.menu_path, item_id);
                         }
                         self.close_menu();
                     }
@@ -778,10 +783,7 @@ impl PointerHandler for App {
                     let hovering = self.workspaces.hit_test(x).is_some()
                         || self.cava.hit_test(x)
                         || widget_hover
-                        || self
-                            .tray
-                            .as_ref()
-                            .map_or(false, |t| t.hit_test(x).is_some());
+                        || self.tray.as_ref().is_some_and(|t| t.hit_test(x).is_some());
                     if let Some(tp) = &self.themed_pointer {
                         let icon = if hovering {
                             CursorIcon::Pointer
@@ -848,16 +850,14 @@ impl PointerHandler for App {
                             run_sync("swaync-client", &["-d"]);
                             self.widgets.refresh_notification();
                             self.draw();
-                        } else if let Some(tray) = &self.tray {
-                            if let Some(item_id) = tray.hit_test(x).map(|s| s.to_string()) {
-                                let (menu_path, menu_items) = tray.menu_for(&item_id);
-                                if let Some(menu_path) = menu_path {
-                                    if !menu_items.is_empty() {
-                                        self.open_menu(
-                                            qh, item_id, menu_path, menu_items, x, serial,
-                                        );
-                                    }
-                                }
+                        } else if let Some(tray) = &self.tray
+                            && let Some(item_id) = tray.hit_test(x).map(|s| s.to_string())
+                        {
+                            let (menu_path, menu_items) = tray.menu_for(&item_id);
+                            if let Some(menu_path) = menu_path
+                                && !menu_items.is_empty()
+                            {
+                                self.open_menu(qh, item_id, menu_path, menu_items, x, serial);
                             }
                         }
                     }
@@ -955,10 +955,8 @@ impl PointerHandler for App {
                         _ => {}
                     }
                 }
-                PointerEventKind::Leave { .. } => {
-                    if self.workspaces.clear_hover() {
-                        self.draw();
-                    }
+                PointerEventKind::Leave { .. } if self.workspaces.clear_hover() => {
+                    self.draw();
                 }
                 _ => {}
             }

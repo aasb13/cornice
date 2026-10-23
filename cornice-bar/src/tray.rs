@@ -231,11 +231,9 @@ fn load_icon_by_name(name: &str, app_theme_path: Option<&str>) -> Option<(Vec<u8
         // Root might itself be a flat directory containing "<name>.png"
         // directly (some apps set icon_theme_path to a flat dir, not a
         // hicolor tree) — try that first since it's cheap.
-        for ext in ["png"] {
-            let flat = format!("{root}/{name}.{ext}");
-            if let Some(result) = try_decode_png(&flat) {
-                return Some(result);
-            }
+        let flat = format!("{root}/{name}.png");
+        if let Some(result) = try_decode_png(&flat) {
+            return Some(result);
         }
 
         for size in SIZES {

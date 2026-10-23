@@ -2,6 +2,13 @@
 name = "cornice-config"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Config loading, commented-template generation and live reload shared by the cornice binaries"
+repository = "https://github.com/aasb13/cornice"
+license = "MIT"
+readme = "../README.md"
+keywords = ["configuration", "toml", "reload", "wayland"]
+categories = ["config"]
 
 [dependencies]
 anyhow = "1.0.104"

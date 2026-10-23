@@ -2,6 +2,13 @@
 name = "cornice-bar"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A Hyprland status bar on wlr-layer-shell: workspaces, cava visualiser, system tray and a waybar-style widget strip"
+repository = "https://github.com/aasb13/cornice"
+license = "MIT"
+readme = "../README.md"
+keywords = ["wayland", "status-bar", "hyprland", "layer-shell"]
+categories = ["gui"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -11,7 +18,7 @@ clap = { version = "4.6.6", features = ["derive"] }
 env_logger = "0.11.11"
 log = "0.4.33"
 nix = { version = "0.31", features = ["signal", "process"] }
-cornice-config = { path = "../cornice-config" }
+cornice-config = { path = "../cornice-config", version = "0.1.0" }
 rusttype = "0.9.3"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

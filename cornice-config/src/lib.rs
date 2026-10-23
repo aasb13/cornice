@@ -188,7 +188,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("cornice-config-test-{}-{name}", std::process::id()));
+        let p =
+            std::env::temp_dir().join(format!("cornice-config-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -330,10 +331,10 @@ mod tests {
         // than racing its startup.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let child_pid: u32 = loop {
-            if let Ok(text) = std::fs::read_to_string(&pidfile) {
-                if let Ok(pid) = text.trim().parse() {
-                    break pid;
-                }
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse()
+            {
+                break pid;
             }
             assert!(child.try_wait().unwrap().is_none(), "sibling exited early");
             assert!(

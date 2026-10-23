@@ -19,8 +19,8 @@ mod color;
 pub(crate) mod cube3d;
 
 pub use color::Color;
-pub use cube3d::Cube3dConfig;
 pub use cornice_config::ReloadConfig;
+pub use cube3d::Cube3dConfig;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};

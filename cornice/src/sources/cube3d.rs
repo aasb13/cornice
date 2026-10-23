@@ -691,6 +691,7 @@ impl RotatingTesseract {
     /// typographic blocks instead of shaded lines. `depth` is the scene-wide
     /// depth range (same one used for the edge sort) so every edge's gradient is
     /// calibrated consistently against every other edge.
+    #[allow(clippy::too_many_arguments)] // per-cell raster state; a struct would be built per line
     fn draw_line(
         grid: &mut [Option<(u8, f32)>],
         cols: u32,
@@ -877,6 +878,7 @@ impl RotatingTesseract {
     /// divide by 256 rather than 255, a difference of at most one level that
     /// is invisible on a glyph edge.
     #[inline]
+    #[allow(clippy::too_many_arguments)] // hot blit loop: canvas geometry is passed as scalars
     fn blit(
         glyph: &Glyph,
         canvas: &mut [u8],
@@ -953,6 +955,7 @@ impl RotatingTesseract {
     /// `ascent * (scale / font_size)` — so the caller computes it once per wall
     /// rather than once per glyph.
     #[inline]
+    #[allow(clippy::too_many_arguments)] // forwards the blit's geometry unchanged
     fn blit_cell(
         glyph: &Glyph,
         canvas: &mut [u8],
@@ -1422,7 +1425,7 @@ mod tests {
             min_y: 0,
             w: 1,
             h: 1,
-            runs: vec![(0 << 16) | (0 << 8) | 1],
+            runs: vec![1],
             row_start: vec![0, 1],
             data: vec![0xff],
         };
@@ -1675,10 +1678,14 @@ mod tests {
     /// bit patterns and must still see them differ.
     #[test]
     fn the_population_key_compares_floats_by_bits() {
-        let mut a = RainConfig::default();
-        a.speed = F32Range::new(-0.0, 1.0);
-        let mut b = RainConfig::default();
-        b.speed = F32Range::new(0.0, 1.0);
+        let a = RainConfig {
+            speed: F32Range::new(-0.0, 1.0),
+            ..RainConfig::default()
+        };
+        let b = RainConfig {
+            speed: F32Range::new(0.0, 1.0),
+            ..RainConfig::default()
+        };
         assert_ne!(
             a.population_key(),
             b.population_key(),
@@ -1700,8 +1707,10 @@ mod tests {
             Some(Duration::from_secs_f64(1.0 / 144.0))
         );
 
-        let mut capped = Config::default();
-        capped.fps_cap = 20;
+        let capped = Config {
+            fps_cap: 20,
+            ..Config::default()
+        };
         s.reconfigure(&capped, 640, 480);
         assert_eq!(s.tick_interval(), Some(Duration::from_secs_f64(1.0 / 20.0)));
     }

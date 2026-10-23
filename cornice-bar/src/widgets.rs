@@ -289,10 +289,10 @@ impl WidgetStrip {
 
     fn maybe_refresh(&mut self) {
         let now = Instant::now();
-        if let Some(t) = self.last_refresh {
-            if now.duration_since(t) < REFRESH_INTERVAL {
-                return;
-            }
+        if let Some(t) = self.last_refresh
+            && now.duration_since(t) < REFRESH_INTERVAL
+        {
+            return;
         }
         self.refresh(now);
         self.last_refresh = Some(now);
@@ -332,15 +332,15 @@ impl WidgetStrip {
         }
         // wifi + ethernet (waybar custom/bandwidth_*: icon only, + rate)
         let cur_net = read_net_dev();
-        if let Some(name) = pick_iface(true) {
-            if let Some(label) = wifi_label(&name, &cur_net, &self.prev_net, dt) {
-                segs.push((SegKind::Other, label));
-            }
+        if let Some(name) = pick_iface(true)
+            && let Some(label) = wifi_label(&name, &cur_net, &self.prev_net, dt)
+        {
+            segs.push((SegKind::Other, label));
         }
-        if let Some(name) = pick_iface(false) {
-            if let Some(label) = eth_label(&name, &cur_net, &self.prev_net, dt) {
-                segs.push((SegKind::Other, label));
-            }
+        if let Some(name) = pick_iface(false)
+            && let Some(label) = eth_label(&name, &cur_net, &self.prev_net, dt)
+        {
+            segs.push((SegKind::Other, label));
         }
         self.prev_net = cur_net;
         // brightness (waybar: `{percent}% {icon}`, icon picked by percent).
@@ -467,11 +467,7 @@ fn read_cpu(prev: &mut Option<(u64, u64)>) -> Option<u8> {
         Some((p_idle, p_total)) => {
             let dt = total.saturating_sub(*p_total);
             let di = idle.saturating_sub(*p_idle);
-            if dt == 0 {
-                0
-            } else {
-                ((dt - di) * 100 / dt) as u8
-            }
+            ((dt - di) * 100).checked_div(dt).unwrap_or(0) as u8
         }
         None => 0,
     };
@@ -484,12 +480,11 @@ fn read_temp() -> Option<u32> {
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for e in entries.flatten() {
             let name = fs::read_to_string(e.path().join("name")).unwrap_or_default();
-            if name.trim() == "coretemp" {
-                if let Ok(t) = fs::read_to_string(e.path().join("temp1_input")) {
-                    if let Ok(m) = t.trim().parse::<u64>() {
-                        return Some((m / 1000) as u32);
-                    }
-                }
+            if name.trim() == "coretemp"
+                && let Ok(t) = fs::read_to_string(e.path().join("temp1_input"))
+                && let Ok(m) = t.trim().parse::<u64>()
+            {
+                return Some((m / 1000) as u32);
             }
         }
     }

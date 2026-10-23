@@ -323,17 +323,7 @@ impl Cava {
 
         match mode {
             CavaMode::Graph => self.render_graph(
-                colors,
-                stroke,
-                canvas,
-                stride,
-                surface_w,
-                x0,
-                top,
-                baseline,
-                plot_h,
-                height,
-                &y_at,
+                colors, stroke, canvas, stride, surface_w, x0, top, baseline, plot_h, height, &y_at,
             ),
             CavaMode::Bars => self.render_bars(stroke, canvas, stride, x0, baseline, &y_at),
         }
@@ -523,11 +513,11 @@ fn reader_loop(
                 while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
                     let line = String::from_utf8_lossy(&buf[..nl]).into_owned();
                     buf.drain(..=nl);
-                    if let Some(frame) = parse_frame(&line) {
-                        if frame.len() == BARS {
-                            *bars.lock().unwrap() = frame;
-                            let _ = redraw_tx.send(());
-                        }
+                    if let Some(frame) = parse_frame(&line)
+                        && frame.len() == BARS
+                    {
+                        *bars.lock().unwrap() = frame;
+                        let _ = redraw_tx.send(());
                     }
                 }
             }
