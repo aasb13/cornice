@@ -1,18 +1,22 @@
 mod config;
+mod display;
 mod power;
 mod source;
 mod sources;
+mod wallpaper;
 mod wayland_backend;
+mod x11_backend;
 
 use anyhow::{Result, bail};
 use clap::Parser;
 use std::path::PathBuf;
 
-/// cornice — a minimal Wayland wallpaper platform.
+/// cornice — a minimal wallpaper platform for Wayland and X11.
 ///
-/// This binary does all the Wayland/layer-shell plumbing: claiming a
-/// monitor, opening a `wlr-layer-shell` background surface, managing the
-/// pixel buffer. It renders whatever `source::FrameSource` you give it.
+/// This binary does all the display plumbing: claiming a monitor, opening a
+/// background surface (a `wlr-layer-shell` layer on Wayland, an
+/// override-redirect window on X11), managing the pixel buffer. It renders
+/// whatever `source::FrameSource` you give it.
 ///
 /// Everything tunable lives in the config file at `~/.config/cornice/config.toml`
 /// (created on first run as a fully commented template of every option), or
@@ -20,8 +24,16 @@ use std::path::PathBuf;
 /// watched automatically (see `[reload]`), or `cornice --reload` tells the
 /// running instance to re-read now.
 #[derive(Parser, Debug)]
-#[command(name = "cornice", about = "A minimal Wayland wallpaper platform")]
+#[command(
+    name = "cornice",
+    about = "A minimal wallpaper platform for Wayland and X11"
+)]
 struct Args {
+    /// Which display server to draw on. `auto` prefers Wayland when
+    /// `WAYLAND_DISPLAY` is set and falls back to X11 when only `DISPLAY` is.
+    #[arg(long, value_enum, default_value_t = display::Backend::Auto)]
+    backend: display::Backend,
+
     /// Which output (monitor) to attach to. Defaults to the leftmost one, which
     /// is the same screen `cornice-bar` picks.
     #[arg(long)]
@@ -101,5 +113,9 @@ fn main() -> Result<()> {
         other => bail!("unknown wallpaper source {other:?}"),
     };
 
-    wayland_backend::run(args.monitor, active_source, reload)
+    match args.backend.resolve()? {
+        display::Backend::Wayland => wayland_backend::run(args.monitor, active_source, reload),
+        display::Backend::X11 => x11_backend::run(args.monitor, active_source, reload),
+        display::Backend::Auto => unreachable!("resolve() never returns Auto"),
+    }
 }

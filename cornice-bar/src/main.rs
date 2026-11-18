@@ -1,14 +1,17 @@
 mod cava;
 mod clock;
 mod config;
+mod display;
 mod hypr;
 mod menu_popup;
+mod render;
 mod theme;
 mod tray;
 mod tray_render;
 mod wayland_backend;
 mod widgets;
 mod workspaces;
+mod x11_backend;
 
 use anyhow::Result;
 use clap::Parser;
@@ -16,6 +19,11 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 struct Args {
+    /// Which display server to draw on. `auto` prefers Wayland when
+    /// `WAYLAND_DISPLAY` is set and falls back to X11 when only `DISPLAY` is.
+    #[arg(long, value_enum, default_value_t = display::Backend::Auto)]
+    backend: display::Backend,
+
     /// Which output (monitor) to attach to. Defaults to the leftmost one, which
     /// is the same screen `cornice` picks.
     #[arg(long)]
@@ -83,10 +91,19 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    wayland_backend::run(
-        args.monitor,
-        args.height,
-        Box::new(clock::Clock::new()),
-        reload,
-    )
+    match args.backend.resolve()? {
+        display::Backend::Wayland => wayland_backend::run(
+            args.monitor,
+            args.height,
+            Box::new(clock::Clock::new()),
+            reload,
+        ),
+        display::Backend::X11 => x11_backend::run(
+            args.monitor,
+            args.height,
+            Box::new(clock::Clock::new()),
+            reload,
+        ),
+        display::Backend::Auto => unreachable!("resolve() never returns Auto"),
+    }
 }

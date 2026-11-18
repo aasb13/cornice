@@ -7,7 +7,7 @@ description = "Config loading, commented-template generation and live reload sha
 repository = "https://github.com/aasb13/cornice"
 license = "MIT"
 readme = "../README.md"
-keywords = ["configuration", "toml", "reload", "wayland"]
+keywords = ["configuration", "toml", "reload", "wayland", "x11"]
 categories = ["config"]
 
 [dependencies]

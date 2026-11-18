@@ -39,16 +39,24 @@ pub struct WorkspaceList {
     layout: Vec<(i32, u32, u32)>,
     /// Currently hovered slot (1..=NUM_SLOTS), for the `:hover` text color.
     hovered: Option<i32>,
-    /// Latest snapshot from the Hyprland event thread.
+    /// Latest snapshot from the Hyprland event thread (or the X11 EWMH poller).
     state: WorkspaceState,
+    /// How a click asks the display server to switch workspace. Hyprland uses
+    /// `hyprctl`; X11 uses an EWMH `_NET_CURRENT_DESKTOP` client message.
+    switcher: Box<dyn Fn(i32)>,
 }
 
 impl WorkspaceList {
     pub fn new() -> Self {
+        Self::with_switcher(Box::new(switch_hyprland))
+    }
+
+    pub fn with_switcher(switcher: Box<dyn Fn(i32)>) -> Self {
         Self {
             layout: Vec::new(),
             hovered: None,
             state: WorkspaceState::default(),
+            switcher,
         }
     }
 
@@ -168,30 +176,33 @@ impl WorkspaceList {
         changed
     }
 
-    /// Ask Hyprland to switch to the given workspace via `hyprctl` directly
-    /// rather than hyprland-rs's own socket dispatch — hyprland-rs still
-    /// sends the pre-Lua-config dispatch string format, which current
-    /// Hyprland's Lua-wrapped command parser rejects. `hyprctl` is kept in
-    /// lockstep with Hyprland itself, so it's the more reliable path for
-    /// dispatch specifically — the crate's *reads* are unaffected, which is why
-    /// the workspace snapshot still comes from it (on the Hyprland event thread,
-    /// where a blocking round-trip is free; see [`crate::hypr`]).
+    /// Ask the display server to switch to the given workspace. The switcher is
+    /// chosen when the list is constructed: `hyprctl` on Wayland, an EWMH client
+    /// message on X11.
     pub fn switch_to(&self, id: i32) {
-        let expr = format!("hl.dsp.focus({{ workspace = \"{id}\" }})");
-        let result = std::process::Command::new("hyprctl")
-            .args(["dispatch", &expr])
-            .output();
-        match result {
-            Ok(out) if !out.status.success() => {
-                log::error!(
-                    "hyprctl dispatch failed (status {:?}): stdout={:?} stderr={:?}",
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
-            Err(err) => log::error!("failed to run hyprctl: {err}"),
-            _ => {}
+        (self.switcher)(id);
+    }
+}
+
+/// Ask Hyprland to switch to the given workspace via `hyprctl` directly rather
+/// than hyprland-rs's own socket dispatch — hyprland-rs still sends the pre-Lua
+/// config dispatch string format, which current Hyprland's Lua-wrapped command
+/// parser rejects.
+fn switch_hyprland(id: i32) {
+    let expr = format!("hl.dsp.focus({{ workspace = \"{id}\" }})");
+    let result = std::process::Command::new("hyprctl")
+        .args(["dispatch", &expr])
+        .output();
+    match result {
+        Ok(out) if !out.status.success() => {
+            log::error!(
+                "hyprctl dispatch failed (status {:?}): stdout={:?} stderr={:?}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
+        Err(err) => log::error!("failed to run hyprctl: {err}"),
+        _ => {}
     }
 }

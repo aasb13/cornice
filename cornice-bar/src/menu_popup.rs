@@ -34,12 +34,93 @@ use crate::theme::{self, draw_text, text_width};
 use crate::tray::MenuItem;
 
 const ROW_HEIGHT: u32 = 26;
+/// Public so the X11 backend can hit-test its own menu window with the same
+/// row geometry as the Wayland popup.
+pub const MENU_ROW_HEIGHT: u32 = ROW_HEIGHT;
 /// Font size for menu labels.
 const FONT_SIZE: f32 = 18.0;
 /// Horizontal padding on each side of the longest label.
 const H_PAD: u32 = 16;
 /// Used only when no font could be loaded (so text can't be measured).
 const FALLBACK_MENU_WIDTH: u32 = 180;
+
+/// Size a menu from its labels: one row per item, as wide as the longest label
+/// plus padding. Shared by both backends so a menu has the same geometry on X11
+/// and Wayland.
+pub fn menu_size(items: &[MenuItem]) -> (u32, u32) {
+    let height = (items.len() as u32 * ROW_HEIGHT).max(ROW_HEIGHT);
+    let width = match theme::font() {
+        Some(font) => {
+            let scale = Scale::uniform(FONT_SIZE);
+            let longest = items
+                .iter()
+                .map(|item| text_width(font, scale, &item.label))
+                .max_by(|a, b| a.total_cmp(b))
+                .unwrap_or(0.0);
+            (longest.ceil() as u32).saturating_add(2 * H_PAD)
+        }
+        None => FALLBACK_MENU_WIDTH,
+    };
+    (width, height)
+}
+
+/// Which item sits at a menu-local y.
+pub fn menu_hit_test(items: &[MenuItem], y: f64) -> Option<i32> {
+    if y < 0.0 {
+        return None;
+    }
+    let row = (y as u32) / ROW_HEIGHT;
+    items.get(row as usize).map(|i| i.id)
+}
+
+/// Paint a menu into a `B, G, R, A` canvas. The caller owns the surface/buffer;
+/// this is only the pixels.
+pub fn render_menu(
+    canvas: &mut [u8],
+    stride: u32,
+    width: u32,
+    height: u32,
+    colors: Colors,
+    items: &[MenuItem],
+    hovered: Option<usize>,
+) {
+    for (row, item) in items.iter().enumerate() {
+        let y0 = row as u32 * ROW_HEIGHT;
+        let row_bg = if Some(row) == hovered {
+            colors.background_hover
+        } else {
+            colors.background
+        }
+        .to_bgra(255);
+        for y in y0..y0 + ROW_HEIGHT {
+            for x in 0..width {
+                let off = (y * stride + x * 4) as usize;
+                if off + 3 < canvas.len() {
+                    canvas[off..off + 4].copy_from_slice(&row_bg);
+                }
+            }
+        }
+
+        if let Some(font) = theme::font() {
+            let scale = Scale::uniform(FONT_SIZE);
+            let v_metrics = font.v_metrics(scale);
+            let pen_y =
+                y0 as f32 + (ROW_HEIGHT as f32 + v_metrics.ascent + v_metrics.descent) / 2.0;
+            let pen_x = (width as f32 - text_width(font, scale, &item.label)) / 2.0;
+            draw_text(
+                font,
+                scale,
+                canvas,
+                stride,
+                (width, height),
+                &item.label,
+                pen_x,
+                pen_y,
+                colors.accent,
+            );
+        }
+    }
+}
 
 pub struct MenuPopup {
     popup: Popup,
@@ -91,23 +172,7 @@ impl MenuPopup {
             + Dispatch<XdgPopup, PopupData>
             + 'static,
     {
-        let height = (items.len() as u32 * ROW_HEIGHT).max(ROW_HEIGHT);
-
-        // The popup is sized to its labels up front, because the SHM buffer is
-        // allocated once and xdg_popup has to be told the size before the first
-        // commit.
-        let width = match theme::font() {
-            Some(font) => {
-                let scale = Scale::uniform(FONT_SIZE);
-                let longest = items
-                    .iter()
-                    .map(|item| text_width(font, scale, &item.label))
-                    .max_by(|a, b| a.total_cmp(b))
-                    .unwrap_or(0.0);
-                (longest.ceil() as u32).saturating_add(2 * H_PAD)
-            }
-            None => FALLBACK_MENU_WIDTH,
-        };
+        let (width, height) = menu_size(&items);
 
         // Position the popup relative to the bar (parent) surface. The positioner's
         // coordinates are measured from the parent's top-left, so we use the
@@ -153,21 +218,13 @@ impl MenuPopup {
             None
         } else {
             let row = (y as u32) / ROW_HEIGHT;
-            if (row as usize) < self.items.len() {
-                Some(row as usize)
-            } else {
-                None
-            }
+            ((row as usize) < self.items.len()).then_some(row as usize)
         };
     }
 
     /// Pointer click in popup-local y coordinate — returns the menu item id, if any.
     pub fn hit_test(&self, y: f64) -> Option<i32> {
-        if y < 0.0 {
-            return None;
-        }
-        let row = (y as u32) / ROW_HEIGHT;
-        self.items.get(row as usize).map(|i| i.id)
+        menu_hit_test(&self.items, y)
     }
 
     pub fn wl_surface(&self) -> &wayland_client::protocol::wl_surface::WlSurface {
@@ -190,43 +247,15 @@ impl MenuPopup {
         };
         let stride = self.width * 4;
 
-        for (row, item) in self.items.iter().enumerate() {
-            let y0 = row as u32 * ROW_HEIGHT;
-            let row_bg = if Some(row) == self.hovered {
-                colors.background_hover
-            } else {
-                colors.background
-            }
-            .to_bgra(255);
-            for y in y0..y0 + ROW_HEIGHT {
-                for x in 0..self.width {
-                    let off = (y * stride + x * 4) as usize;
-                    if off + 3 < canvas.len() {
-                        canvas[off..off + 4].copy_from_slice(&row_bg);
-                    }
-                }
-            }
-
-            if let Some(font) = theme::font() {
-                let scale = Scale::uniform(FONT_SIZE);
-                let v_metrics = font.v_metrics(scale);
-                let pen_y =
-                    y0 as f32 + (ROW_HEIGHT as f32 + v_metrics.ascent + v_metrics.descent) / 2.0;
-                let pen_x = (self.width as f32 - text_width(font, scale, &item.label)) / 2.0;
-                // Bounds are the popup's own surface, not the bar's.
-                draw_text(
-                    font,
-                    scale,
-                    canvas,
-                    stride,
-                    (self.width, self.height),
-                    &item.label,
-                    pen_x,
-                    pen_y,
-                    colors.accent,
-                );
-            }
-        }
+        render_menu(
+            canvas,
+            stride,
+            self.width,
+            self.height,
+            colors,
+            &self.items,
+            self.hovered,
+        );
 
         self.popup
             .wl_surface()

@@ -1,7 +1,7 @@
 //! The extension point.
 //!
-//! `cornice` itself only knows how to talk to Wayland: claim a monitor,
-//! open a `wlr-layer-shell` background surface, hand you a pixel buffer.
+//! `cornice` owns the display plumbing: claim a monitor, open a background
+//! surface (a Wayland layer or an X11 window), hand you a pixel buffer.
 //! It has no idea what an image, a video, or an audio visualizer is — and
 //! it doesn't need to. All of that lives in a `FrameSource` implementation
 //! compiled directly into this binary. Nothing external, no IPC, no socket:
@@ -12,9 +12,10 @@ use std::time::Duration;
 /// Something that can render pixels into the wallpaper.
 pub trait FrameSource {
     /// Called exactly once, right after the real pixel dimensions of the
-    /// wallpaper surface are known (i.e. after the first Wayland `configure`
-    /// event). Use this to load an image, start a decoder, connect to
-    /// PulseAudio for cava-style visualization, etc.
+    /// wallpaper surface are known (after the first Wayland `configure` event,
+    /// or once the X11 window has been sized). Use this to load an image,
+    /// start a decoder, connect to PulseAudio for cava-style visualization,
+    /// etc.
     fn init(&mut self, width: u32, height: u32) {
         let _ = (width, height);
     }
@@ -26,10 +27,10 @@ pub trait FrameSource {
     /// row padding), 4 bytes per pixel, `XRGB8888` (i.e. each pixel is the
     /// four bytes `B, G, R, X` in memory, native/little-endian).
     ///
-    /// Return `true` if you actually drew something new (cornice will
-    /// damage the surface and commit it to the compositor). Return `false`
-    /// to skip this tick with no commit — cheap for e.g. an audio
-    /// visualizer that has nothing new to show yet.
+    /// Return `true` if you actually drew something new (cornice will publish
+    /// the frame to the display server). Return `false` to skip this tick with
+    /// no commit — cheap for e.g. an audio visualizer that has nothing new to
+    /// show yet.
     fn render(&mut self, canvas: &mut [u8], width: u32, height: u32, stride: u32) -> bool;
 
     /// How often `render` should be called after the first draw.

@@ -3,11 +3,11 @@ name = "cornice"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A minimal Wayland wallpaper platform: a layer-shell background surface plus a pluggable frame source"
+description = "A minimal wallpaper platform for Wayland and X11: a layer-shell background surface (or an X11 background window) plus a pluggable frame source"
 repository = "https://github.com/aasb13/cornice"
 license = "MIT"
 readme = "../README.md"
-keywords = ["wayland", "wallpaper", "layer-shell", "hyprland"]
+keywords = ["wayland", "x11", "wallpaper", "layer-shell", "hyprland"]
 categories = ["gui"]
 
 [dependencies]
@@ -24,3 +24,4 @@ serde = { version = "1", features = ["derive"] }
 smithay-client-toolkit = "0.20.0"
 toml = "0.8"
 wayland-client = "0.31.15"
+x11rb = { version = "0.14", features = ["randr"] }

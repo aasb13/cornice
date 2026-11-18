@@ -1,12 +1,13 @@
 # cornice
 
-A minimal Wayland desktop, in two binaries.
+A minimal desktop for Wayland and X11, in two binaries.
 
 ![cornice and cornice-bar on Hyprland](docs/screenshot.png)
 
-- **`cornice`** — the wallpaper. Claims one monitor with `wlr-layer-shell`, opens
-  a background surface, and renders a pluggable `FrameSource` into it. The
-  bundled source is a rotating 4D ASCII tesseract behind a field of matrix rain.
+- **`cornice`** — the wallpaper. Claims one monitor, opens a background surface
+  (`wlr-layer-shell` on Wayland, a lowered override-redirect window on X11), and
+  renders a pluggable `FrameSource` into it. The bundled source is a rotating 4D
+  ASCII tesseract behind a field of matrix rain.
 - **`cornice-bar`** — the bar. Workspaces, a cava audio visualiser, the system
   tray, and a waybar-style widget strip: volume, CPU, temperature, memory,
   network, brightness, keyboard layout and battery.
@@ -21,11 +22,12 @@ $ cornice-bar    # status bar
 
 ## Requirements
 
-- A Wayland compositor implementing `wlr-layer-shell`. Developed against
-  **Hyprland**. The wallpaper needs only the protocol; the bar additionally
-  reads Hyprland state over `hyprctl`.
+- A Wayland compositor implementing `wlr-layer-shell` (developed against
+  **Hyprland**), **or** an X server. RandR 1.5 is used for monitor names and
+  geometry on X11; without it the whole screen is treated as one output.
 - Rust **1.88+**.
-- `libxkbcommon` and the usual Wayland client libraries at build time.
+- `libxkbcommon` and the usual Wayland client libraries at build time. The X11
+  client is pure Rust and needs no extra system libraries.
 - A monospace font — see [Fonts](#fonts).
 
 Optional, for the bar's richer modules. Each one degrades gracefully when the
@@ -74,6 +76,31 @@ Under Hyprland, add both to your startup after its sockets exist:
 exec-once = cornice
 exec-once = cornice-bar
 ```
+
+### Display backend
+
+Both binaries pick the backend automatically: Wayland when `WAYLAND_DISPLAY` is
+set, X11 when only `DISPLAY` is set. Force one with `--backend`:
+
+```console
+$ cornice --backend x11
+$ cornice-bar --backend wayland --monitor DP-1
+```
+
+`--backend auto` is the default. Under XWayland both variables are usually set,
+so auto picks Wayland — pass `--backend x11` to draw through X11 instead.
+
+On X11 the wallpaper is an override-redirect window lowered below every other
+window, and the bar is one raised to the top with an EWMH dock strut. There is no
+compositor-exclusive zone, so a WM that ignores struts may let tiled windows
+overlap the bar. Both draw with the root window's visual: the wallpaper's
+`XRGB8888` pixels map straight onto it, while the bar's transparent gaps read as
+black instead of showing the wallpaper through. The tray menu uses an
+override-redirect window with a pointer grab, so clicking outside it still
+dismisses it. Workspaces come from EWMH
+(`_NET_CURRENT_DESKTOP` / `_NET_NUMBER_OF_DESKTOPS`) instead of Hyprland; the
+keyboard-layout segment still reads `hyprctl` and is simply blank when it is
+unavailable.
 
 ## Configuration
 
@@ -193,9 +220,9 @@ the config with `font_path` and `waterfall_font_path`.
 ## How it fits together
 
 ```
-cornice/          wallpaper binary: Wayland plumbing, power monitor, FrameSource
+cornice/          wallpaper binary: Wayland/X11 plumbing, power monitor, FrameSource
   sources/        the cube3d source (tesseract + rain)
-cornice-bar/      bar binary: modules, tray, menu popups, Hyprland events
+cornice-bar/      bar binary: modules, tray, menu popups, Hyprland/EWMH events
 cornice-config/   shared config loading, template generation, live reload, SIGHUP
 ```
 

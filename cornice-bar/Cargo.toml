@@ -3,11 +3,11 @@ name = "cornice-bar"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A Hyprland status bar on wlr-layer-shell: workspaces, cava visualiser, system tray and a waybar-style widget strip"
+description = "A status bar for Wayland and X11: workspaces, cava visualiser, system tray and a waybar-style widget strip"
 repository = "https://github.com/aasb13/cornice"
 license = "MIT"
 readme = "../README.md"
-keywords = ["wayland", "status-bar", "hyprland", "layer-shell"]
+keywords = ["wayland", "x11", "status-bar", "hyprland", "layer-shell"]
 categories = ["gui"]
 
 [dependencies]
@@ -30,3 +30,4 @@ hyprland = "0.4.0-beta.3"
 smithay-client-toolkit = "0.20.0"
 wayland-client = "0.31.15"
 wayland-protocols = "0.32"
+x11rb = { version = "0.14", features = ["randr"] }

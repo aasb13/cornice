@@ -1,8 +1,16 @@
-use crate::theme::SIDE_MARGIN;
+use crate::clock::Clock;
+use crate::config::Config;
+use crate::display::{leftmost, names};
+use crate::hypr::{self, HyprEvent};
+use crate::menu_popup::MenuPopup;
+use crate::render::{Bar, Cursor, MenuRequest, PointerButton};
+use crate::tray;
+use crate::workspaces::WorkspaceList;
 use anyhow::{Context, Result, anyhow, bail};
 use calloop::EventLoop;
 use calloop::timer::{TimeoutAction, Timer};
 use calloop_wayland_source::WaylandSource;
+use cornice_config::Reload;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
@@ -31,97 +39,6 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
 };
-
-use crate::cava::Cava;
-use crate::clock::Clock;
-use crate::config::Config;
-use crate::hypr::{self, HyprEvent};
-use crate::menu_popup::MenuPopup;
-use crate::tray::{self};
-use crate::tray_render::TrayRenderer;
-use crate::widgets::{SegKind, WidgetStrip};
-use crate::workspaces::WorkspaceList;
-use cornice_config::Reload;
-
-/// Volume scroll step in percent. Matches waybar `pulseaudio`'s default
-/// `scroll-step` (the user's config has no override); volume is capped at 100%
-/// via `wpctl set-volume -l 1.0 …` (waybar `max-volume: 100`). Adjust to taste.
-const VOL_SCROLL_STEP: u8 = 1;
-/// Brightness scroll step in percent. Matches waybar `backlight`'s default
-/// `scroll-step` (the user's config has no override). Adjust to taste.
-const BRIGHT_SCROLL_STEP: u8 = 1;
-
-/// Launch an external command detached so it never blocks the bar — mirrors
-/// waybar's `on-click`/`on-scroll` execution. A short-lived reaper thread
-/// waits on the child so we don't accumulate zombies (matters for scroll-repeat
-/// firing `wpctl`/`brightnessctl` many times per second).
-fn spawn(cmd: &str, args: &[&str]) {
-    use std::process::Stdio;
-    match std::process::Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(mut child) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
-        Err(err) => log::error!("failed to spawn {cmd}: {err}"),
-    }
-}
-
-/// Run a command to completion before returning, so a follow-up re-read sees
-/// the applied change. Used for the bar's own `set`-style actions (volume,
-/// brightness, DND toggle) which are re-read immediately after — unlike
-/// `spawn`, which is fire-and-forget for GUI launchers. These commands are
-/// fast (a few ms of dbus/sysfs round-trips), matching waybar's synchronous
-/// on-scroll/on-click behavior; `.status()` also reaps the child, so no
-/// reaper thread is needed and rapid scroll can't accumulate zombies.
-fn run_sync(cmd: &str, args: &[&str]) {
-    use std::process::Stdio;
-    if let Err(err) = std::process::Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        log::error!("failed to run {cmd}: {err}");
-    }
-}
-
-/// Index of the output to use when `monitor` is `None`.
-///
-/// Kept identical to the same function in `cornice`, down to the tests. It used
-/// to pick `outputs.first()` where cornice picked `outputs.last()`, which on a
-/// two-monitor machine could put the bar on a different screen from the wallpaper
-/// — and in an order that isn't specified, since `OutputState::outputs` is in
-/// registry-advertisement order and can change across a hotplug or restart.
-///
-/// Leftmost by geometry, then name, is a heuristic rather than a primary-output
-/// query (core Wayland has none), but it is the same screen every run and the
-/// same screen cornice picks. If the compositor withholds geometry — every
-/// location reported as `(0, 0)` — the name breaks the tie.
-fn leftmost(outputs: &[(Option<String>, (i32, i32))]) -> Option<usize> {
-    outputs
-        .iter()
-        .enumerate()
-        // `is_none` sorts false first, so a named output beats an unnamed one at
-        // the same position: it is the one `--monitor` can refer to.
-        .min_by_key(|(_, (name, (x, y)))| (*x, *y, name.is_none(), name.clone()))
-        .map(|(i, _)| i)
-}
-
-/// Every output name, for an error message that says what *was* available.
-fn names(outputs: &[(Option<String>, (i32, i32))]) -> Vec<&str> {
-    outputs
-        .iter()
-        .map(|(n, _)| n.as_deref().unwrap_or("(unnamed)"))
-        .collect()
-}
 
 /// Claim `monitor` (or, if `None`, the leftmost output — see [`leftmost`]) and
 /// render the bar into a `wlr-layer-shell` surface on it. Blocks forever.
@@ -161,20 +78,15 @@ pub fn run(
         pointer: None,
         themed_pointer: None,
         seat: None,
-        clock,
-        workspaces: Box::new(WorkspaceList::new()),
-        widgets: Box::new(WidgetStrip::new()),
-        cava: Box::new(Cava::new()),
-        tray: None,
+        bar: Bar::new(clock, Box::new(WorkspaceList::new()), reload, None),
         menu: None,
         scroll_accum: 0.0,
-        reload,
     };
 
     // The bar's render timer is inserted unconditionally and re-reads its own
     // interval every tick, so `[reload] interval_ms` takes effect on the next
     // reload without the source being rebuilt.
-    let reload_interval = app.reload.interval();
+    let reload_interval = app.bar.reload.interval();
 
     event_queue
         .roundtrip(&mut app)
@@ -273,11 +185,11 @@ pub fn run(
     loop_handle
         .insert_source(hypr_rx, move |event, _, app: &mut App| match event {
             calloop::channel::Event::Msg(HyprEvent::Workspaces(state)) => {
-                app.workspaces.set_state(state);
+                app.bar.workspaces.set_state(state);
                 app.draw();
             }
             calloop::channel::Event::Msg(HyprEvent::LayoutChanged) => {
-                app.widgets.refresh_language();
+                app.bar.widgets.refresh_language();
                 app.draw();
             }
             _ => {}
@@ -286,7 +198,7 @@ pub fn run(
 
     let (tray_tx, tray_rx) = calloop::channel::channel::<()>();
     let (tray_icons, tray_cmd_tx) = tray::spawn(tray_tx);
-    app.tray = Some(crate::tray_render::TrayRenderer::new(
+    app.bar.tray = Some(crate::tray_render::TrayRenderer::new(
         tray_icons,
         tray_cmd_tx,
     ));
@@ -307,7 +219,7 @@ pub fn run(
             }
         })
         .map_err(|e| anyhow!("failed to insert cava event source: {e}"))?;
-    app.cava.spawn(cava_tx);
+    app.bar.cava.spawn(cava_tx);
 
     // Config reloading. The poll timer is what makes an edit to the file take
     // effect; the signal source is what makes `--reload` immediate, since the
@@ -327,9 +239,9 @@ pub fn run(
                     // reads the palette fresh — but redrawing costs nothing at
                     // one second's cadence and keeps the reload honest if a
                     // future option turns out to affect layout.
-                    app.check_reload();
+                    app.bar.check_reload();
                     app.draw();
-                    TimeoutAction::ToDuration(app.reload.interval())
+                    TimeoutAction::ToDuration(app.bar.reload.interval())
                 },
             )
             .map_err(|e| anyhow!("failed to insert reload timer: {e}"))?;
@@ -341,7 +253,8 @@ pub fn run(
             calloop::signals::Signals::new(&[calloop::signals::Signal::SIGHUP])
                 .context("failed to create SIGHUP source")?,
             |_, _, app: &mut App| {
-                app.force_reload();
+                app.bar.force_reload();
+                app.draw();
             },
         )
         .map_err(|e| anyhow!("failed to insert SIGHUP source: {e}"))?;
@@ -374,11 +287,8 @@ struct App {
     themed_pointer: Option<ThemedPointer>,
     /// The wl_seat — kept so the tray menu popup can grab it on right-click.
     seat: Option<wl_seat::WlSeat>,
-    clock: Box<Clock>,
-    workspaces: Box<WorkspaceList>,
-    widgets: Box<WidgetStrip>,
-    cava: Box<Cava>,
-    tray: Option<TrayRenderer>,
+    /// Everything drawn into the bar, plus its config and reload state.
+    bar: Bar,
     menu: Option<MenuPopup>,
     /// Leftover sub-step touchpad scroll distance (in the same units as
     /// `Axis::vertical.absolute`, ~15px per logical step) carried over
@@ -390,32 +300,9 @@ struct App {
     /// 15px, i.e. you have to flick the touchpad hard. Accumulating here and
     /// consuming whole steps out of the running total fixes that.
     scroll_accum: f64,
-    /// Live config reloading: the file watcher plus the manual `SIGHUP` path.
-    /// Owns the config in force, so there is one place a reload writes it.
-    reload: Reload<Config>,
 }
 
 impl App {
-    /// Re-read the config if the file changed on disk. `Reload::poll` returns
-    /// `None` both when nothing changed and when the file is broken — the latter
-    /// is logged inside, which is the point of reloading live rather than at
-    /// startup: saving a half-finished file mid-edit must not take the bar off
-    /// the screen.
-    fn check_reload(&mut self) {
-        if self.reload.poll().is_some() {
-            log::info!("config reloaded from disk");
-        }
-    }
-
-    /// Re-read and apply the config, unconditionally. The `SIGHUP` source uses
-    /// this, since it has to work whether or not `[reload] watch` is on and
-    /// whether or not the file looks changed.
-    fn force_reload(&mut self) {
-        if self.reload.force().is_some() {
-            log::info!("config reloaded from SIGHUP");
-        }
-    }
-
     fn draw(&mut self) {
         let (width, height) = (self.width, self.height);
         if width == 0 || height == 0 {
@@ -441,51 +328,7 @@ impl App {
             }
         };
 
-        for pixel in canvas.as_chunks_mut::<4>().0 {
-            pixel[0] = 0;
-            pixel[1] = 0;
-            pixel[2] = 0;
-            pixel[3] = 0; // fully transparent — argb8888 is premultiplied, so 0 alpha means 0 everywhere
-        }
-
-        // One palette for the whole frame, read once. Handing the same borrow to every
-        // module is what makes a reload take effect everywhere at the next redraw
-        // instead of each module holding a copy that has to be refreshed
-        // separately.
-        let colors = &self.reload.config().colors;
-
-        self.clock.render(
-            colors,
-            canvas,
-            SIDE_MARGIN,
-            width - SIDE_MARGIN,
-            height,
-            stride as u32,
-        );
-        self.workspaces
-            .render(colors, canvas, SIDE_MARGIN, height, stride as u32);
-        // cava: waybar `modules-left = [hyprland/workspaces, cava]` — sits right
-        // after workspaces with the waybar 6px gap (`#workspaces { margin: 0
-        // 6px 0 0 }` right margin) between them.
-        let cava_x = SIDE_MARGIN + self.workspaces.width() + 6;
-        self.cava.render(
-            colors,
-            self.reload.config().cava.mode,
-            canvas,
-            cava_x,
-            height,
-            stride as u32,
-        );
-        // Right side: the seamless widget strip is rightmost (battery right
-        // cap at the inset edge); the tray is rendered to its LEFT with the
-        // waybar 14px gap between them.
-        let widgets_w =
-            self.widgets
-                .render(colors, canvas, width - SIDE_MARGIN, height, stride as u32);
-        let tray_right = width - SIDE_MARGIN - widgets_w - if widgets_w > 0 { 14 } else { 0 };
-        if let Some(tray) = &mut self.tray {
-            tray.render(colors, canvas, tray_right, height, stride as u32);
-        }
+        self.bar.render(canvas, width, height, stride as u32);
 
         layer
             .wl_surface()
@@ -497,20 +340,22 @@ impl App {
         layer.commit();
     }
 
-    fn open_menu(
-        &mut self,
-        qh: &QueueHandle<Self>,
-        owner_id: String,
-        menu_path: String,
-        items: Vec<crate::tray::MenuItem>,
-        click_x: f64,
-        serial: u32,
-    ) {
+    fn set_cursor(&self, conn: &Connection, cursor: Cursor) {
+        if let Some(tp) = &self.themed_pointer {
+            let icon = match cursor {
+                Cursor::Default => CursorIcon::Default,
+                Cursor::Pointer => CursorIcon::Pointer,
+            };
+            let _ = tp.set_cursor(conn, icon);
+        }
+    }
+
+    fn open_menu(&mut self, qh: &QueueHandle<Self>, request: MenuRequest) {
         self.close_menu();
         // The positioner wants the absolute click x measured from the bar's
         // left edge (the parent surface's coordinate origin), not the distance
         // from the right edge.
-        let click_x = click_x as i32;
+        let click_x = request.x as i32;
         let Some(parent_layer) = self.layer.as_ref() else {
             return;
         };
@@ -518,17 +363,17 @@ impl App {
             return;
         };
         let seat = seat.clone();
-        match crate::menu_popup::MenuPopup::create(
+        match MenuPopup::create(
             qh,
             &self.compositor_state,
             &self.xdg_shell,
             &self.shm,
             parent_layer,
             &seat,
-            serial,
-            owner_id,
-            menu_path,
-            items,
+            request.serial,
+            request.owner_id,
+            request.menu_path,
+            request.items,
             click_x,
             self.height,
         ) {
@@ -631,7 +476,7 @@ impl LayerShellHandler for App {
             let _ = self
                 .menu
                 .as_mut()
-                .map(|m| m.draw(self.reload.config().colors));
+                .map(|m| m.draw(self.bar.reload.config().colors));
         }
     }
 }
@@ -648,7 +493,7 @@ impl PopupHandler for App {
         // MenuPopup::create). We match by the popup's wl_surface, but since
         // only one menu is open at a time we can just repaint it directly.
         if let Some(menu) = &mut self.menu {
-            menu.draw(self.reload.config().colors);
+            menu.draw(self.bar.reload.config().colors);
         }
     }
 
@@ -720,6 +565,7 @@ impl PointerHandler for App {
                 .menu
                 .as_ref()
                 .is_some_and(|m| m.wl_surface() == &event.surface);
+            let menu_open = self.menu.is_some();
 
             if on_menu {
                 match event.kind {
@@ -727,25 +573,21 @@ impl PointerHandler for App {
                         let (_x, y) = event.position;
                         if let Some(menu) = &mut self.menu {
                             menu.set_hover(y);
-                            menu.draw(self.reload.config().colors);
+                            menu.draw(self.bar.reload.config().colors);
                         }
-                        if let Some(tp) = &self.themed_pointer {
-                            let _ = tp.set_cursor(conn, CursorIcon::Pointer);
-                        }
+                        self.set_cursor(conn, Cursor::Pointer);
                     }
                     PointerEventKind::Press { button: 0x110, .. } => {
                         let (_x, y) = event.position;
                         if let Some(menu) = &self.menu
                             && let Some(item_id) = menu.hit_test(y)
-                            && let Some(tray) = &self.tray
+                            && let Some(tray) = &self.bar.tray
                         {
                             tray.click_menu_item(&menu.owner_id, &menu.menu_path, item_id);
                         }
                         self.close_menu();
                     }
-                    PointerEventKind::Leave { .. } => {
-                        self.close_menu();
-                    }
+                    PointerEventKind::Leave { .. } => self.close_menu(),
                     _ => {}
                 }
                 continue;
@@ -756,206 +598,59 @@ impl PointerHandler for App {
             }
 
             match event.kind {
-                PointerEventKind::Enter { .. } => {
-                    if let Some(tp) = &self.themed_pointer {
-                        let _ = tp.set_cursor(conn, CursorIcon::Default);
-                    }
-                }
+                PointerEventKind::Enter { .. } => self.set_cursor(conn, Cursor::Default),
                 PointerEventKind::Motion { .. } => {
                     let (x, _y) = event.position;
-                    // While the tray menu is open it captures the pointer: bar
-                    // motion doesn't change workspace hover (the click is
-                    // supposed to go to the menu, not the bar underneath).
-                    let hover_changed = if self.menu.is_none() {
-                        self.workspaces.update_hover(x)
-                    } else {
-                        false
-                    };
-                    // Show the pointer hand over anything clickable/scrollable:
-                    // workspaces, cava, tray icons, and the actionable widget
-                    // segments (volume/notification/brightness).
-                    let widget_hover = matches!(
-                        self.widgets.hit_test(x),
-                        Some(SegKind::Volume)
-                            | Some(SegKind::Notification)
-                            | Some(SegKind::Brightness)
-                    );
-                    let hovering = self.workspaces.hit_test(x).is_some()
-                        || self.cava.hit_test(x)
-                        || widget_hover
-                        || self.tray.as_ref().is_some_and(|t| t.hit_test(x).is_some());
-                    if let Some(tp) = &self.themed_pointer {
-                        let icon = if hovering {
-                            CursorIcon::Pointer
-                        } else {
-                            CursorIcon::Default
-                        };
-                        let _ = tp.set_cursor(conn, icon);
-                    }
-                    if hover_changed {
+                    let hover = self.bar.motion(x, menu_open);
+                    self.set_cursor(conn, hover.cursor);
+                    if hover.redraw {
                         self.draw();
                     }
                 }
                 PointerEventKind::Press { button, serial, .. } => {
                     let (x, _y) = event.position;
-                    // While the tray menu is open it "takes" the click: any
-                    // press on the bar just closes the menu and consumes the
-                    // event — you can't click workspaces/tray icons (or open
-                    // another menu) until the current menu is dismissed.
-                    if self.menu.is_some() {
+                    // An open menu takes the click; it can only be dismissed.
+                    if menu_open {
                         self.close_menu();
+                        self.draw();
                         continue;
                     }
-                    if button == 0x110 {
-                        // BTN_LEFT
-                        if let Some(id) = self.workspaces.hit_test(x) {
-                            self.close_menu();
-                            self.workspaces.switch_to(id);
-                            self.draw();
-                        } else if let Some(item_id) = self
-                            .tray
-                            .as_ref()
-                            .and_then(|t| t.hit_test(x).map(|s| s.to_string()))
-                        {
-                            self.close_menu();
-                            if let Some(tray) = &self.tray {
-                                tray.activate(&item_id);
-                            }
-                        } else if let Some(seg) = self.widgets.hit_test(x) {
-                            self.close_menu();
-                            match seg {
-                                // waybar pulseaudio `on-click: pavucontrol`
-                                SegKind::Volume => spawn("pavucontrol", &[]),
-                                // waybar custom/notification `on-click: swaync -t`
-                                SegKind::Notification => spawn("swaync-client", &["-t"]),
-                                SegKind::Brightness | SegKind::Language | SegKind::Other => {}
-                            }
-                        } else {
-                            self.close_menu();
-                        }
-                    } else if button == 0x111 {
-                        // BTN_RIGHT — toggle the tray icon's context menu.
-                        // First click opens it (grabbed on the press serial);
-                        // a second RMB (while it's open) just closes it.
-                        if self.menu.is_some() {
-                            self.close_menu();
-                        } else if self.cava.hit_test(x) {
-                            // waybar `cava` `on-click-right: mode` → pause/resume.
-                            self.cava.toggle_pause();
-                        } else if self.widgets.hit_test(x) == Some(SegKind::Notification) {
-                            // waybar custom/notification `on-click-right: swaync -d`
-                            // → toggle Do-Not-Disturb. Run synchronously so the
-                            // bell icon flips immediately (the periodic 1s refresh
-                            // would otherwise lag by up to a second).
-                            run_sync("swaync-client", &["-d"]);
-                            self.widgets.refresh_notification();
-                            self.draw();
-                        } else if let Some(tray) = &self.tray
-                            && let Some(item_id) = tray.hit_test(x).map(|s| s.to_string())
-                        {
-                            let (menu_path, menu_items) = tray.menu_for(&item_id);
-                            if let Some(menu_path) = menu_path
-                                && !menu_items.is_empty()
-                            {
-                                self.open_menu(qh, item_id, menu_path, menu_items, x, serial);
-                            }
-                        }
+                    let button = match button {
+                        0x110 => PointerButton::Left,
+                        0x111 => PointerButton::Right,
+                        _ => continue,
+                    };
+                    let (redraw, menu) = self.bar.press(button, x, serial, false);
+                    if let Some(menu) = menu {
+                        self.open_menu(qh, menu);
+                    }
+                    if redraw {
+                        self.draw();
                     }
                 }
                 PointerEventKind::Axis { vertical, .. } => {
-                    let (x, _y) = event.position;
-                    if self.menu.is_some() {
+                    if menu_open {
                         continue;
                     }
-                    // Vertical scroll only (matches a normal mouse wheel; we
-                    // ignore horizontal pans so they don't nudge volume).
-                    // One logical step per 120 (high-res wheel); fall back to
-                    // the deprecated `discrete` field, then to the continuous
-                    // `absolute` magnitude for touchpads (~15px ≈ one notch).
+                    let (x, _y) = event.position;
+                    // One logical step per 120 for high-res wheels, then the
+                    // legacy `discrete` field, then continuous touchpad deltas
+                    // (~15px ≈ one notch) accumulated across events.
                     let steps: i32 = if vertical.value120 != 0 {
-                        // High-res mouse wheel: one whole logical step per
-                        // event already, nothing to accumulate.
                         vertical.value120 / 120
                     } else if vertical.discrete != 0 {
-                        // Legacy wheel: same, one discrete notch per event.
                         vertical.discrete
                     } else {
-                        // Touchpad (continuous `absolute`, no discrete
-                        // notches): a single physical scroll fires many
-                        // events of a few px each. Add this event's delta to
-                        // the running total and only emit whole ~15px steps,
-                        // keeping the fractional remainder for the next
-                        // event instead of dropping it. Without this,
-                        // truncating per-event rounds almost every touchpad
-                        // event down to 0 steps, so light scrolling does
-                        // nothing and only a hard flick (>15px in one event)
-                        // registers.
                         self.scroll_accum += vertical.absolute;
                         let s = (self.scroll_accum / 15.0) as i32;
                         self.scroll_accum -= s as f64 * 15.0;
                         s
                     };
-                    if steps == 0 {
-                        continue;
-                    }
-                    let n = steps.unsigned_abs();
-                    // Wayland vertical-axis sign convention: the value is a
-                    // motion vector in surface coords (positive = down). A
-                    // traditional mouse wheel rolled UP produces a NEGATIVE
-                    // value (content moves up), so wheel-up → increase means
-                    // `up = steps < 0`. (This is why `steps > 0` was inverted.)
-                    let up = steps < 0;
-                    match self.widgets.hit_test(x) {
-                        Some(SegKind::Volume) => {
-                            // waybar pulseaudio default scroll: volume ±step,
-                            // capped at 100% (`max-volume: 100`) via `-l 1.0`.
-                            let arg = if up {
-                                format!("{VOL_SCROLL_STEP}%+")
-                            } else {
-                                format!("{VOL_SCROLL_STEP}%-")
-                            };
-                            for _ in 0..n {
-                                run_sync(
-                                    "wpctl",
-                                    &[
-                                        "set-volume",
-                                        "-l",
-                                        "1.0",
-                                        "@DEFAULT_AUDIO_SINK@",
-                                        arg.as_str(),
-                                    ],
-                                );
-                            }
-                            // The set ran to completion above, so this re-read
-                            // sees the new level (a detached `spawn` would race
-                            // the read and show the old value until the next
-                            // periodic refresh). Patch only the volume segment so
-                            // the rest of the strip (CPU/temp/mem/…) keeps its
-                            // cached values instead of re-sampling on every
-                            // scroll tick.
-                            self.widgets.refresh_volume();
-                            self.draw();
-                        }
-                        Some(SegKind::Brightness) => {
-                            // waybar backlight default scroll: brightness ±step.
-                            let arg = if up {
-                                format!("+{BRIGHT_SCROLL_STEP}%")
-                            } else {
-                                format!("{BRIGHT_SCROLL_STEP}%-")
-                            };
-                            for _ in 0..n {
-                                run_sync("brightnessctl", &["set", arg.as_str()]);
-                            }
-                            // `run_sync` waited for the set to apply, so this
-                            // re-read reflects the new brightness immediately (a
-                            // detached spawn would race it).
-                            self.widgets.refresh_brightness();
-                            self.draw();
-                        }
-                        _ => {}
+                    if self.bar.axis(steps, x) {
+                        self.draw();
                     }
                 }
-                PointerEventKind::Leave { .. } if self.workspaces.clear_hover() => {
+                PointerEventKind::Leave { .. } if self.bar.leave() => {
                     self.draw();
                 }
                 _ => {}

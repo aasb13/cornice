@@ -4,8 +4,9 @@
 //! `wl_shm` pixel buffer, and a render loop that calls into a
 //! `crate::source::FrameSource`.
 //!
-//! Nothing in this file knows or cares what's being rendered — that's the
-//! whole point.
+//! What happens to the pixels is [`crate::wallpaper::Wallpaper`]'s job, shared
+//! with the X11 backend. This file only owns the surface, the buffer and the
+//! compositor protocol.
 
 use anyhow::{Context, Result, anyhow, bail};
 use calloop::EventLoop;
@@ -35,43 +36,11 @@ use wayland_client::{
     protocol::{wl_output, wl_shm, wl_surface},
 };
 
-use crate::config::{Config, PowerSaveConfig, PowerState};
-use crate::power::PowerMonitor;
+use crate::config::Config;
+use crate::display::{leftmost, names};
 use crate::source::FrameSource;
+use crate::wallpaper::Wallpaper;
 use cornice_config::Reload;
-
-/// Index of the output to use when `monitor` is `None`.
-///
-/// Deterministic on purpose. `OutputState::outputs` is in registry-advertisement
-/// order — whatever order the compositor enumerated its globals in — which is not
-/// specified and can change across a hotplug or a compositor restart. This
-/// previously picked `outputs.last()`, while `cornice-bar` picked `outputs.first()`,
-/// so on a two-monitor machine the wallpaper and the bar could silently end up on
-/// different screens. Ordering by geometry (then y, then name) picks the same
-/// screen on every run and the same screen for both programs. Leftmost is the
-/// conventional "main monitor"; it is a heuristic, not a primary-output query,
-/// which core Wayland does not have.
-///
-/// If the compositor withholds geometry — `OutputInfo::location` is documented as
-/// possibly always `(0, 0)` — every output ties and the name breaks it, which is
-/// still deterministic.
-fn leftmost(outputs: &[(Option<String>, (i32, i32))]) -> Option<usize> {
-    outputs
-        .iter()
-        .enumerate()
-        // `is_none` sorts false first, so a named output beats an unnamed one at
-        // the same position: it is the one `--monitor` can refer to.
-        .min_by_key(|(_, (name, (x, y)))| (*x, *y, name.is_none(), name.clone()))
-        .map(|(i, _)| i)
-}
-
-/// Every output name, for an error message that says what *was* available.
-fn names(outputs: &[(Option<String>, (i32, i32))]) -> Vec<&str> {
-    outputs
-        .iter()
-        .map(|(n, _)| n.as_deref().unwrap_or("(unnamed)"))
-        .collect()
-}
 
 /// Claim `monitor` (or, if `None`, the leftmost output — see [`leftmost`]) and
 /// start rendering `source` into a `wlr-layer-shell` background surface on it.
@@ -102,14 +71,11 @@ pub fn run(
         height: 0,
         configured: false,
         exit: false,
-        source,
+        wallpaper: Wallpaper::new(source, reload),
         interval: None,
         buffer: None,
         buf_w: 0,
         buf_h: 0,
-        battery: PowerMonitor::new(),
-        power: PowerState::default(),
-        reload,
     };
 
     // Two roundtrips, same as the original C main(): the first lets the
@@ -225,7 +191,7 @@ pub fn run(
                     // Re-read the interval every tick rather than capturing it, so
                     // a source that changes its mind (frame-rate cap following the
                     // power state, say) is honoured from the very next frame.
-                    let next = app.source.tick_interval().unwrap_or(interval);
+                    let next = app.wallpaper.tick_interval().unwrap_or(interval);
                     TimeoutAction::ToDuration(next)
                 },
             )
@@ -247,7 +213,7 @@ pub fn run(
             calloop::signals::Signals::new(&[calloop::signals::Signal::SIGHUP])
                 .context("failed to create SIGHUP source")?,
             |_, _, app: &mut App| {
-                app.force_reload();
+                app.wallpaper.force_reload();
             },
         )
         .map_err(|e| anyhow!("failed to insert SIGHUP source: {e}"))?;
@@ -272,20 +238,12 @@ struct App {
     height: u32,
     configured: bool,
     exit: bool,
-    source: Box<dyn FrameSource>,
+    /// Source, battery, power budget, config and config watcher all live here;
+    /// the X11 backend owns an identical one.
+    wallpaper: Wallpaper,
     /// Set once, right after `init`, from `source.tick_interval()`, and then
     /// only used as the render timer's initial delay and fallback.
     interval: Option<std::time::Duration>,
-    /// Battery state, refreshed by a background thread (see [`PowerMonitor`]).
-    battery: PowerMonitor,
-    /// What the source currently believes about the power budget — not the
-    /// machine's actual battery state, which is re-read from `battery` every
-    /// time it matters. Keeping the two apart is what lets a config edit change
-    /// the answer without the battery itself having changed.
-    power: PowerState,
-    /// The config in force, plus the file watcher and the manual `SIGHUP` path.
-    /// Owns `[power_save]` too, so there is one place a reload writes it.
-    reload: Reload<Config>,
     /// The single SHM buffer we draw into, reused frame after frame. Replacing
     /// this (only on resize) drops the old one and lets the slot pool reclaim
     /// the memory. Keeping one buffer — instead of allocating a new one every
@@ -295,89 +253,8 @@ struct App {
     buf_h: u32,
 }
 
-/// The power state to push to the source, or `None` if it already has it.
-///
-/// Split out from [`App::check_power`] so the transition table is testable
-/// without a Wayland connection. Comparing the whole [`PowerState`] rather than
-/// just the on/off half is what lets a `[power_save]` edit reach the source while
-/// the machine is still unplugged: with a bool as the key, retuning the battery
-/// frame rate produced the same key and so nothing was sent.
-fn next_power_state(
-    last: PowerState,
-    power_save: &PowerSaveConfig,
-    discharging: bool,
-) -> Option<PowerState> {
-    let now = power_save.resolve(discharging);
-    (now != last).then_some(now)
-}
-
 impl App {
-    /// Re-read the config if it changed on disk. `Reload::poll` returns `None`
-    /// both when nothing changed and when the file is broken — the latter is
-    /// logged inside, which is the whole point of doing this live rather than at
-    /// startup: being mid-edit and saving a half-finished file must not blank the
-    /// wallpaper or kill the process.
-    fn check_reload(&mut self) {
-        if self.reload.poll().is_some() {
-            self.apply_config("config file changed");
-        }
-    }
-
-    /// Re-read and apply the config, unconditionally. The `SIGHUP` source uses
-    /// this, since it has to work whether or not `[reload] watch` is on and
-    /// whether or not the file looks changed.
-    fn force_reload(&mut self) {
-        if self.reload.force().is_some() {
-            self.apply_config("SIGHUP");
-        }
-    }
-
-    /// Adopt the config `Reload` just installed.
-    ///
-    /// `Reload` has already read, validated and swapped it in by this point — the
-    /// power-save table, the reload settings and the source's own settings all
-    /// come out of the same new value, so they cannot disagree about which
-    /// config is in force.
-    fn apply_config(&mut self, reason: &str) {
-        info!("applying config ({reason})");
-        // The battery state may have changed *meaning*: `enabled` could have been
-        // turned off, or the new cap applied while unplugged. `check_power`
-        // recomputes from the new config and notifies the source if the
-        // effective answer moved. The new cap itself reaches the source through
-        // `reconfigure`, not through here — `set_power_saving` only carries the
-        // on/off half.
-        self.check_power();
-        let (w, h) = (self.width, self.height);
-        self.source.reconfigure(self.reload.config(), w, h);
-        info!("config reloaded");
-    }
-
-    /// Notice a change of power source and tell the source about it.
-    /// Unplugging costs a throttled wallpaper; plugging back in must always
-    /// restore full speed. Called once per frame, and it costs one atomic load.
-    fn check_power(&mut self) {
-        let discharging = self.battery.poll();
-        let Some(now) = next_power_state(self.power, &self.reload.config().power_save, discharging)
-        else {
-            return;
-        };
-        self.power = now;
-        log::info!(
-            "power state: {}",
-            if now.throttling {
-                "on battery, throttling"
-            } else {
-                "on mains, full speed"
-            }
-        );
-        self.source.set_power_saving(now);
-    }
-
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
-        // Cheap enough to do every frame (one atomic load), and it means a
-        // battery change takes effect as soon as the background thread sees it.
-        self.check_power();
-        self.check_reload();
         let layer = match &self.layer {
             Some(l) => l,
             None => return,
@@ -429,7 +306,7 @@ impl App {
             }
         };
 
-        let updated = self.source.render(canvas, width, height, stride as u32);
+        let updated = self.wallpaper.render(canvas, width, height, stride as u32);
         if !updated {
             return;
         }
@@ -507,21 +384,13 @@ impl LayerShellHandler for App {
         if w > 0 && h > 0 {
             self.width = w;
             self.height = h;
+            self.wallpaper.set_dimensions(w, h);
         }
         if !self.configured {
             self.configured = true;
-            self.source.init(self.width, self.height);
-            // The first battery reading happens before the first frame, so a
-            // wallpaper that boots on battery starts throttled. There is no
-            // prior belief to compare against, so the source is told either way.
-            let discharging = self.battery.poll();
-            let power = self.reload.config().power_save.resolve(discharging);
-            self.power = power;
-            self.source.set_power_saving(power);
-            if power.throttling {
-                log::info!("running on battery: starting throttled");
-            }
-            self.interval = self.source.tick_interval();
+            self.wallpaper.set_dimensions(self.width, self.height);
+            self.wallpaper.init(self.width, self.height);
+            self.interval = self.wallpaper.interval();
             self.draw(qh);
         }
     }
@@ -545,146 +414,3 @@ delegate_output!(App);
 delegate_shm!(App);
 delegate_layer!(App);
 delegate_registry!(App);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn power_save(enabled: bool, fps_cap: u32) -> PowerSaveConfig {
-        PowerSaveConfig {
-            enabled,
-            fps_cap,
-            ..Default::default()
-        }
-    }
-
-    /// The source only hears about the power budget when the answer actually
-    /// changes, so this table is the whole notification contract. Each row is
-    /// (what the source currently believes, `enabled`, the battery cap, whether a
-    /// battery is discharging, and what the source must be told).
-    ///
-    /// The last two rows are the bugs this exists to pin down, both cases where
-    /// the *battery* never moves but the answer does:
-    ///
-    /// * `enabled` turned off while unplugged. A notification keyed only on
-    ///   battery transitions never fires, and the wallpaper stays throttled
-    ///   forever. An earlier version forced this by clearing the remembered
-    ///   state before re-checking, which collided with a genuine "not
-    ///   throttling" and instead skipped the notification for this row.
-    /// * The battery cap retuned while unplugged. With the on/off half as the
-    ///   key this produced an identical key, so the new cap stayed invisible —
-    ///   it only worked because the source happened to keep its own copy of the
-    ///   config. Comparing the whole resolved state is what makes it reach the
-    ///   source on its own.
-    #[test]
-    fn the_source_is_told_exactly_when_the_budget_moves() {
-        // `false` = "not throttling", which is what `PowerState::default` is.
-        let idle = PowerState::default();
-        let throttled_at = |cap| PowerState {
-            throttling: true,
-            fps_cap: cap,
-            density_divisor: 4,
-        };
-        let cases: &[(PowerState, bool, u32, bool, Option<PowerState>)] = &[
-            // Idle on mains: nothing to say, ever.
-            (idle, true, 30, false, None),
-            // Unplugged from a full-speed start: throttle.
-            (idle, true, 30, true, Some(throttled_at(30))),
-            // Plugged back in: always restore full speed.
-            (throttled_at(30), true, 30, false, Some(idle)),
-            // Disabled while unplugged: the battery is unchanged, but the answer
-            // is not — the source must be told to stop throttling.
-            (throttled_at(30), false, 30, true, Some(idle)),
-            // Retuned while still unplugged: same battery, different budget.
-            (throttled_at(30), true, 15, true, Some(throttled_at(15))),
-            // Still throttled on the same budget: no change.
-            (throttled_at(30), true, 30, true, None),
-        ];
-        for &(last, enabled, cap, discharging, expected) in cases {
-            let got = next_power_state(last, &power_save(enabled, cap), discharging);
-            assert_eq!(
-                got, expected,
-                "last={last:?} enabled={enabled} cap={cap} discharging={discharging}"
-            );
-        }
-    }
-
-    /// The whole point of the rule: a stable answer, and the leftmost screen, so
-    /// the wallpaper lands where the bar does. Reordering the inputs must not
-    /// change *which output* is chosen — that is the property registry order
-    /// fails to give, and comparing names rather than indices is what proves it.
-    #[test]
-    fn the_default_output_is_the_leftmost_and_does_not_depend_on_order() {
-        let names_and_geometry = [("DP-2", (1920, 0)), ("eDP-1", (0, 0)), ("DP-1", (0, 1080))];
-        let chosen = |order: &[usize]| {
-            let outputs: Vec<_> = order
-                .iter()
-                .map(|&i| {
-                    let (name, at) = names_and_geometry[i];
-                    (Some(name.to_string()), at)
-                })
-                .collect();
-            let i = leftmost(&outputs).expect("non-empty");
-            names_and_geometry[order[i]].0
-        };
-
-        assert_eq!(
-            chosen(&[0, 1, 2]),
-            "eDP-1",
-            "leftmost is the one at x=0,y=0"
-        );
-        for order in [[2, 1, 0], [1, 2, 0], [2, 0, 1], [1, 0, 2], [0, 2, 1]] {
-            assert_eq!(
-                chosen(&order),
-                "eDP-1",
-                "reordering changed the answer: {order:?}"
-            );
-        }
-    }
-
-    /// Column before row, which is what makes this "leftmost" and not "topmost": a
-    /// monitor stacked *below* the origin beats one off to the right, because x
-    /// is compared first even though its y is much larger.
-    #[test]
-    fn x_is_compared_before_y() {
-        let outputs = vec![
-            (Some("below".to_string()), (0, 1080)),
-            (Some("right".to_string()), (1920, 0)),
-        ];
-        assert_eq!(leftmost(&outputs), Some(0));
-    }
-
-    /// Two outputs at the same spot can't happen in practice, but the compositor
-    /// is allowed to report every location as (0,0). The name has to break that
-    /// tie or the choice falls back to registry order again.
-    #[test]
-    fn a_compositor_that_withholds_geometry_still_picks_deterministically() {
-        let outputs = vec![
-            (Some("DP-1".to_string()), (0, 0)),
-            (Some("eDP-1".to_string()), (0, 0)),
-        ];
-        assert_eq!(leftmost(&outputs), Some(0), "names break the 0,0 tie");
-        let mut reversed = outputs.clone();
-        reversed.reverse();
-        assert_eq!(leftmost(&reversed), Some(1));
-    }
-
-    /// An unnamed output still has to be usable — it's just beaten by a named one
-    /// at the same position, since `--monitor` can't refer to it.
-    #[test]
-    fn an_unnamed_output_is_still_a_candidate() {
-        assert_eq!(leftmost(&[]), None);
-        assert_eq!(leftmost(&[(None, (500, 0))]), Some(0));
-        let named = Some("HDMI-1".to_string());
-        let outputs = vec![(None, (500, 0)), (named, (500, 0))];
-        assert_eq!(leftmost(&outputs), Some(1));
-    }
-
-    /// The error has to say what was available, or the user has no way to find
-    /// the right name to pass.
-    #[test]
-    fn the_error_lists_the_names_that_exist() {
-        let outputs = vec![(Some("DP-1".to_string()), (0, 0)), (None, (1920, 0))];
-        assert_eq!(names(&outputs), vec!["DP-1", "(unnamed)"]);
-    }
-}
