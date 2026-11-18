@@ -29,7 +29,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::display::{leftmost, names};
 use crate::menu_popup::{menu_hit_test, menu_size, render_menu};
-use crate::render::{Bar, MenuRequest, PointerButton};
+use crate::render::{Bar, Cursor, MenuRequest, PointerButton};
 use crate::theme::TOP_MARGIN;
 use crate::tray;
 use crate::tray_render::TrayRenderer;
@@ -56,6 +56,12 @@ enum XEvent {
     Leave(Window),
     /// Root properties changed: re-read EWMH desktop state.
     DesktopChanged,
+    /// The window manager changed our geometry (managed windows only).
+    Configure {
+        window: Window,
+        width: u16,
+        height: u16,
+    },
     Destroy(Window),
 }
 
@@ -65,6 +71,10 @@ struct Atoms {
     window_type: Atom,
     window_type_dock: Atom,
     strut_partial: Atom,
+    state: Atom,
+    skip_taskbar: Atom,
+    skip_pager: Atom,
+    wm_hints: Atom,
 }
 
 fn intern(conn: &RustConnection, name: &str) -> Result<Atom> {
@@ -84,6 +94,10 @@ fn atoms(conn: &RustConnection) -> Result<Atoms> {
         window_type: intern(conn, "_NET_WM_WINDOW_TYPE")?,
         window_type_dock: intern(conn, "_NET_WM_WINDOW_TYPE_DOCK")?,
         strut_partial: intern(conn, "_NET_WM_STRUT_PARTIAL")?,
+        state: intern(conn, "_NET_WM_STATE")?,
+        skip_taskbar: intern(conn, "_NET_WM_STATE_SKIP_TASKBAR")?,
+        skip_pager: intern(conn, "_NET_WM_STATE_SKIP_PAGER")?,
+        wm_hints: intern(conn, "WM_HINTS")?,
     })
 }
 
@@ -115,6 +129,11 @@ fn spawn_event_reader(conn: Arc<RustConnection>, root: Window, tx: Sender<XEvent
                 }),
                 Event::LeaveNotify(e) => Some(XEvent::Leave(e.event)),
                 Event::PropertyNotify(e) if e.window == root => Some(XEvent::DesktopChanged),
+                Event::ConfigureNotify(e) => Some(XEvent::Configure {
+                    window: e.window,
+                    width: e.width,
+                    height: e.height,
+                }),
                 Event::DestroyNotify(e) => Some(XEvent::Destroy(e.window)),
                 Event::Error(err) => {
                     error!("x11 error: {err:?}");
@@ -258,8 +277,37 @@ struct XMenu {
     hovered: Option<usize>,
 }
 
-/// Claim `monitor` (or the leftmost one) and draw the bar into an
-/// override-redirect window on it. Blocks until the window is destroyed.
+/// Glyph cursors from X's built-in `cursor` font. `left_ptr` and `hand2` are
+/// the same pair the Wayland backend asks the compositor for on non-clickable
+/// and clickable segments. Returns `None` when the font is unavailable, in
+/// which case the server's default cursor is left in place.
+fn create_cursors(conn: &RustConnection) -> Option<(XCursor, XCursor)> {
+    let font = conn.generate_id().ok()?;
+    conn.open_font(font, b"cursor").ok()?;
+    let default = conn.generate_id().ok()?;
+    let hand = conn.generate_id().ok()?;
+    // In the cursor font the mask glyph is the source glyph + 1.
+    for (cursor, glyph) in [(default, 68u16), (hand, 60u16)] {
+        conn.create_glyph_cursor(
+            cursor,
+            font,
+            font,
+            glyph,
+            glyph + 1,
+            0,
+            0,
+            0,
+            0xffff,
+            0xffff,
+            0xffff,
+        )
+        .ok()?;
+    }
+    Some((default, hand))
+}
+
+/// Claim `monitor` (or the leftmost one) and draw the bar into a managed EWMH
+/// dock window on it. Blocks until the window is destroyed.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     monitor: Option<String>,
@@ -298,7 +346,10 @@ pub fn run(
         WindowClass::INPUT_OUTPUT,
         visual,
         &CreateWindowAux::new()
-            .override_redirect(1u32)
+            // A managed dock, not an override-redirect window: only a managed
+            // window gets its EWMH strut honoured, so tiled windows stop at the
+            // bar instead of being covered by it.
+            .override_redirect(0u32)
             .background_pixmap(Pixmap::from(0u32))
             .event_mask(
                 EventMask::EXPOSURE
@@ -316,11 +367,6 @@ pub fn run(
         .context("failed to create graphics context")?;
     conn.map_window(window)
         .context("failed to map bar window")?;
-    conn.configure_window(
-        window,
-        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-    )
-    .context("failed to raise bar window")?;
 
     // A dock window type and a partial strut are the closest X11 has to the
     // exclusive zone a Wayland layer surface gets. WMs that honour EWMH will
@@ -353,6 +399,29 @@ pub fn run(
             0,
         ],
     )?;
+
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        atoms.wm_hints,
+        atoms.wm_hints,
+        &[
+            1, // flags: InputHint
+            0, // input: false — clicking the bar must not steal focus
+            0, 0, 0, 0, 0, 0, 0,
+        ],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        atoms.state,
+        AtomEnum::ATOM,
+        &[atoms.skip_taskbar, atoms.skip_pager],
+    )?;
+    let cursors = create_cursors(&conn);
+    if let Some((default, _)) = cursors {
+        conn.change_window_attributes(window, &ChangeWindowAttributesAux::new().cursor(default))?;
+    }
 
     // Property changes on the root tell us when the WM switches desktops.
     conn.change_window_attributes(
@@ -413,6 +482,8 @@ pub fn run(
         pixels: vec![0; (width as usize * 4).saturating_mul(bar_height as usize)],
         bar,
         menu: None,
+        cursors,
+        pointer_cursor: false,
         exit: false,
     };
     app.draw_bar()?;
@@ -517,6 +588,9 @@ struct App {
     pixels: Vec<u8>,
     bar: Bar,
     menu: Option<XMenu>,
+    cursors: Option<(XCursor, XCursor)>,
+    /// Which cursor is currently set, so we only send a change on transitions.
+    pointer_cursor: bool,
     exit: bool,
 }
 
@@ -541,6 +615,26 @@ impl App {
             self.depth,
             &self.pixels,
         )
+    }
+
+    /// Swap the bar window's cursor between the normal pointer and the hand
+    /// used over clickable segments, mirroring the Wayland backend.
+    fn set_cursor(&mut self, pointer: bool) {
+        if self.pointer_cursor == pointer {
+            return;
+        }
+        if let Some((default, hand)) = self.cursors {
+            let cursor = if pointer { hand } else { default };
+            if let Err(err) = self.conn.change_window_attributes(
+                self.bar_window,
+                &ChangeWindowAttributesAux::new().cursor(cursor),
+            ) {
+                log::warn!("failed to set bar cursor: {err}");
+            } else {
+                let _ = self.conn.flush();
+            }
+        }
+        self.pointer_cursor = pointer;
     }
 
     fn close_menu(&mut self) {
@@ -606,6 +700,13 @@ impl App {
             error!("failed to create menu window: {err}");
             return;
         }
+        let hand = self
+            .cursors
+            .map(|(_, hand)| hand)
+            .unwrap_or(XCursor::from(0u32));
+        let _ = self
+            .conn
+            .change_window_attributes(window, &ChangeWindowAttributesAux::new().cursor(hand));
         // Grab the pointer so clicks outside the menu still reach us: the grab
         // routes every pointer event to the menu window with menu-local coords.
         if let Err(err) = self.conn.grab_pointer(
@@ -615,7 +716,7 @@ impl App {
             GrabMode::ASYNC,
             GrabMode::ASYNC,
             Window::from(0u32),
-            XCursor::from(0u32),
+            hand,
             0u32,
         ) {
             error!("failed to grab pointer for menu: {err}");
@@ -766,6 +867,7 @@ impl App {
                 }
                 if window == self.bar_window {
                     let hover = self.bar.motion(f64::from(x), self.menu.is_some());
+                    self.set_cursor(hover.cursor == Cursor::Pointer);
                     if hover.redraw {
                         self.draw_bar()?;
                     }
@@ -780,6 +882,17 @@ impl App {
                 let state = desktop_state(&self.conn, self.root, &self.atoms);
                 self.bar.workspaces.set_state(state);
                 self.draw_bar()?;
+            }
+            XEvent::Configure {
+                window,
+                width,
+                height,
+            } => {
+                if window == self.bar_window && width > 0 && height > 0 {
+                    self.width = width as u32;
+                    self.height = height as u32;
+                    self.draw_bar()?;
+                }
             }
             XEvent::Destroy(window) => {
                 if window == self.bar_window {

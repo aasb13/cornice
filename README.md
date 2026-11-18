@@ -5,8 +5,8 @@ A minimal desktop for Wayland and X11, in two binaries.
 ![cornice and cornice-bar on Hyprland](docs/screenshot.png)
 
 - **`cornice`** — the wallpaper. Claims one monitor, opens a background surface
-  (`wlr-layer-shell` on Wayland, a lowered override-redirect window on X11), and
-  renders a pluggable `FrameSource` into it. The bundled source is a rotating 4D
+  (`wlr-layer-shell` on Wayland, an EWMH desktop window on X11), and renders a
+  pluggable `FrameSource` into it. The bundled source is a rotating 4D
   ASCII tesseract behind a field of matrix rain.
 - **`cornice-bar`** — the bar. Workspaces, a cava audio visualiser, the system
   tray, and a waybar-style widget strip: volume, CPU, temperature, memory,
@@ -90,17 +90,16 @@ $ cornice-bar --backend wayland --monitor DP-1
 `--backend auto` is the default. Under XWayland both variables are usually set,
 so auto picks Wayland — pass `--backend x11` to draw through X11 instead.
 
-On X11 the wallpaper is an override-redirect window lowered below every other
-window, and the bar is one raised to the top with an EWMH dock strut. There is no
-compositor-exclusive zone, so a WM that ignores struts may let tiled windows
-overlap the bar. Both draw with the root window's visual: the wallpaper's
-`XRGB8888` pixels map straight onto it, while the bar's transparent gaps read as
-black instead of showing the wallpaper through. The tray menu uses an
-override-redirect window with a pointer grab, so clicking outside it still
-dismisses it. Workspaces come from EWMH
-(`_NET_CURRENT_DESKTOP` / `_NET_NUMBER_OF_DESKTOPS`) instead of Hyprland; the
-keyboard-layout segment still reads `hyprctl` and is simply blank when it is
-unavailable.
+On X11 the wallpaper is a managed EWMH desktop-type window (kept below every
+other window), and the bar is a managed dock window with a partial strut. A WM
+that ignores EWMH may still let tiled windows overlap the bar, and the bar's
+transparent gaps read as black rather than showing the wallpaper through. Both
+draw with the root window's visual. The tray menu stays override-redirect with a
+pointer grab, so clicking outside it still dismisses it. Workspaces come from
+EWMH (`_NET_CURRENT_DESKTOP` / `_NET_NUMBER_OF_DESKTOPS`) instead of Hyprland;
+the keyboard-layout segment still reads `hyprctl` and is simply blank when it is
+unavailable. Hovering clickable bar segments shows the hand cursor, as on
+Wayland.
 
 ## Configuration
 

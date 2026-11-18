@@ -1,9 +1,10 @@
 //! The X11 half of the wallpaper.
 //!
 //! X11 has no `wlr-layer-shell`: the closest equivalent of a background layer
-//! is an override-redirect window lowered to the bottom of the stack and sized
-//! to one RandR monitor. It is drawn with `PutImage` into a plain SHM-style byte
-//! buffer, which is exactly the `XRGB8888` layout `FrameSource` already writes.
+//! is a managed EWMH desktop-type window, which every compliant WM keeps below
+//! all other windows, sized to one RandR monitor. It is drawn with `PutImage`
+//! into a plain SHM-style byte buffer, which is exactly the `XRGB8888` layout
+//! `FrameSource` already writes.
 
 use std::sync::Arc;
 
@@ -16,10 +17,11 @@ use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::Event;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, Gcontext,
-    ImageFormat, Pixmap, StackMode, Window, WindowClass,
+    Atom, AtomEnum, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux,
+    EventMask, Gcontext, ImageFormat, Pixmap, PropMode, StackMode, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
 use crate::config::Config;
 use crate::display::{leftmost, names};
@@ -34,7 +36,18 @@ type Monitor = (Option<String>, (i32, i32), u32, u32);
 /// What the blocking event-reader thread forwards to the event loop.
 enum XEvent {
     Expose,
+    Configure { width: u16, height: u16 },
     Destroy,
+}
+
+fn intern(conn: &RustConnection, name: &str) -> Result<Atom> {
+    let atom = conn
+        .intern_atom(false, name.as_bytes())
+        .with_context(|| format!("failed to intern atom {name}"))?
+        .reply()
+        .with_context(|| format!("failed to intern atom {name}"))?
+        .atom;
+    Ok(atom)
 }
 
 /// Spawn the one thread that blocks on the X socket. Everything else —
@@ -46,6 +59,17 @@ fn spawn_event_reader(conn: Arc<RustConnection>, window: Window, tx: Sender<XEve
             match conn.wait_for_event() {
                 Ok(Event::Expose(event)) if event.window == window => {
                     if tx.send(XEvent::Expose).is_err() {
+                        break;
+                    }
+                }
+                Ok(Event::ConfigureNotify(event)) if event.window == window => {
+                    if tx
+                        .send(XEvent::Configure {
+                            width: event.width,
+                            height: event.height,
+                        })
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -197,7 +221,10 @@ pub fn run(
         WindowClass::INPUT_OUTPUT,
         screen.root_visual,
         &CreateWindowAux::new()
-            .override_redirect(1u32)
+            // Managed, with the EWMH desktop window type: a WM that ignores
+            // stacking requests for override-redirect windows still keeps this
+            // one below every other window.
+            .override_redirect(0u32)
             .background_pixmap(Pixmap::from(0u32))
             .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
     )
@@ -206,8 +233,35 @@ pub fn run(
     conn.create_gc(gc, window, &CreateGCAux::new())
         .context("failed to create X graphics context")?;
     conn.map_window(window).context("failed to map X window")?;
-    // Override-redirect windows are not managed, so the stacking we ask for is
-    // the stacking we get: below every other window, i.e. a wallpaper.
+    let window_type = intern(&conn, "_NET_WM_WINDOW_TYPE")?;
+    let desktop = intern(&conn, "_NET_WM_WINDOW_TYPE_DESKTOP")?;
+    let state = intern(&conn, "_NET_WM_STATE")?;
+    let skip_taskbar = intern(&conn, "_NET_WM_STATE_SKIP_TASKBAR")?;
+    let skip_pager = intern(&conn, "_NET_WM_STATE_SKIP_PAGER")?;
+    let wm_hints = intern(&conn, "WM_HINTS")?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        window_type,
+        AtomEnum::ATOM,
+        &[desktop],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        state,
+        AtomEnum::ATOM,
+        &[skip_taskbar, skip_pager],
+    )?;
+    // InputHint = 0: the wallpaper must never take focus.
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        wm_hints,
+        wm_hints,
+        &[1, 0, 0, 0, 0, 0, 0, 0, 0],
+    )?;
+    // Still lower explicitly: for WMs without EWMH this is the only hint.
     conn.configure_window(
         window,
         &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
@@ -240,6 +294,16 @@ pub fn run(
             channel::Event::Msg(XEvent::Expose) => {
                 if let Err(err) = app.draw() {
                     error!("failed to redraw wallpaper: {err}");
+                }
+            }
+            channel::Event::Msg(XEvent::Configure { width, height }) => {
+                if width > 0 && height > 0 {
+                    app.width = width as u32;
+                    app.height = height as u32;
+                    app.wallpaper.resize(width as u32, height as u32);
+                    if let Err(err) = app.draw() {
+                        error!("failed to redraw wallpaper: {err}");
+                    }
                 }
             }
             channel::Event::Msg(XEvent::Destroy) | channel::Event::Closed => {

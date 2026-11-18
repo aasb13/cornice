@@ -97,6 +97,13 @@ impl Wallpaper {
         self.dimensions = (width, height);
     }
 
+    /// The window manager resized the surface: remember the new dimensions and
+    /// tell the source so it can rebuild any size-dependent caches.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.dimensions = (width, height);
+        self.source.reconfigure(self.reload.config(), width, height);
+    }
+
     /// Notice a change of power source and tell the source about it. Unplugging
     /// costs a throttled wallpaper; plugging back in always restores full speed.
     /// Called once per frame, and it costs one atomic load.
